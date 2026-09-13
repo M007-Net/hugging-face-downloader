@@ -27,7 +27,7 @@ class Transfer extends EventEmitter {
   async pause() { if (this.busy) { this.pausing = true; await this.done; } return this.job; }
   async run(executable, options, token) {
     const port = await freePort(); const secret = randomBytes(24).toString('hex');
-    const args = ['--no-conf=true', '--enable-rpc=true', '--rpc-listen-all=false', `--rpc-listen-port=${port}`, `--rpc-secret=${secret}`, `--disable-ipv6=${!!options.disableIPv6}`, '--console-log-level=error', '--download-result=hide', '--summary-interval=0', '--enable-color=false'];
+    const args = ['--no-conf=true', '--enable-rpc=true', '--rpc-listen-all=false', `--rpc-listen-port=${port}`, `--rpc-secret=${secret}`, '--disable-ipv6=true', '--console-log-level=error', '--download-result=hide', '--summary-interval=0', '--enable-color=false'];
     const child = spawn(executable, args, { windowsHide: true, stdio: ['ignore','pipe','pipe'] });
     this.child = child; let processError;
     child.on('error', e => { processError = e; });
@@ -53,7 +53,7 @@ class Transfer extends EventEmitter {
         fs.mkdirSync(path.dirname(target), { recursive: true });
         if (file.size > 0 && fs.existsSync(target) && fs.statSync(target).size === file.size && !fs.existsSync(target + '.aria2')) { file.status = 'complete'; file.completed = file.size; this.publish(); continue; }
         const connections = String(Math.min(16, Math.max(1, Number(options.connections) || 16)));
-        const downloadOptions = { dir: path.dirname(target), out: path.basename(target), continue:'true', 'auto-file-renaming':'false', 'file-allocation':'none', split: connections, 'max-connection-per-server': connections, 'min-split-size':'1M', 'max-tries':'5', 'retry-wait':'3', 'timeout':'60', 'connect-timeout':'30', 'disable-ipv6':String(!!options.disableIPv6) };
+        const downloadOptions = { dir: path.dirname(target), out: path.basename(target), continue:'true', 'auto-file-renaming':'false', 'file-allocation':'none', split: connections, 'max-connection-per-server': connections, 'min-split-size':'1M', 'max-tries':'5', 'retry-wait':'3', 'timeout':'60', 'connect-timeout':'30', 'disable-ipv6':'true' };
         if (token) downloadOptions.header = [`Authorization: Bearer ${token}`];
         const gid = await rpc('addUri', [[this.urlForFile(this.job.info, file.path)], downloadOptions]);
         file.status = 'downloading'; this.publish();

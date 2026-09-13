@@ -32,7 +32,10 @@ if (-not $script:AppSettingsPath) {
     $script:AppSettingsPath = Join-Path $configRoot 'HuggingFaceDownloader\settings.json'
 }
 $script:TransferConnections = $Connections
-$script:TransferDisableIPv6 = $DisableIPv6.IsPresent
+# Hugging Face transfers are intentionally IPv4-only. Keep the legacy switch
+# accepted so older shortcuts/scripts continue to work, but never allow an
+# accidental IPv6 fallback.
+$script:TransferDisableIPv6 = $true
 $script:ConfiguredAria2 = $Aria2Path
 
 # ---------------------------------------------------------------- helpers ---
@@ -543,7 +546,7 @@ function Get-Aria2Args {
         '--console-log-level=warn',
         '--user-agent=hf-download-ps/1.0'
     )
-    if ($script:TransferDisableIPv6) { $a += '--disable-ipv6=true' }
+    $a += '--disable-ipv6=true'
     if ($Token) { $a += "--header=Authorization: Bearer $Token" }
     return $a
 }
