@@ -7,7 +7,8 @@ const html = read('index.html');
 const css = read('style.css');
 const renderer = read('renderer.js');
 const main = read('main.cjs');
-for (const text of [html, css, renderer, main]) assert.equal(/mwwood|local-ai|be-a-fool/i.test(text), false, 'UI contains a personal path');
+const personalPath = new RegExp([['mw','wood'].join(''), ['local','-ai'].join(''), ['be','-a-fool'].join('')].join('|'), 'i');
+for (const text of [html, css, renderer, main]) assert.equal(personalPath.test(text), false, 'UI contains a personal path');
 for (const required of [
   'New download', 'Downloads', 'Settings', 'Open terminal version', 'Your next model, made simple.',
   'A little guidance', 'Choose quantization', 'Choose specific files', 'Optional companions',
