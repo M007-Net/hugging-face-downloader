@@ -1,0 +1,16 @@
+settings*.json
+hf-download.settings.json
+*.local.json
+*.bak
+*.aria2
+*.gguf
+*.safetensors
+downloads/
+bin/
+node_modules/
+qa-output/
+release/
+.env
+.env.*
+token
+*.log

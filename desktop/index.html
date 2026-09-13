@@ -1,0 +1,14 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'none'; object-src 'none'; base-uri 'none'"><title>Hugging Face Downloader</title><link rel="stylesheet" href="style.css"></head>
+<body>
+  <aside class="sidebar">
+    <div class="brand"><span class="brandmark">↓</span><div>HUGGING FACE<strong>Downloader</strong></div></div>
+    <div class="nav-label">YOUR WORKSPACE</div>
+    <nav aria-label="Main navigation"><button data-page="new" class="nav active"><span>＋</span> New download</button><button data-page="downloads" class="nav"><span>↓</span> Downloads <b id="queue-badge"></b></button><button data-page="settings" class="nav"><span>⚙</span> Settings</button></nav>
+    <div class="sidebar-bottom"><button id="terminal" class="nav"><span>›_</span> Open terminal version</button><div class="local-note"><span class="dot"></span><div>Saved on your computer<small>Files go straight to your chosen folder.</small></div></div><div class="version">DESKTOP EDITION <span id="version"></span></div></div>
+  </aside>
+  <main><header><div>Workspace <span>/</span> <b id="breadcrumb">New download</b></div><button class="engine-pill" id="engine-pill">Checking download engine…</button></header>
+    <div class="content"><div id="notice" role="alert" hidden></div><div id="app"></div></div>
+  </main><script src="renderer.js"></script>
+</body></html>
