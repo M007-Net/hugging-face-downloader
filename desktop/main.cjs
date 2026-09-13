@@ -18,7 +18,7 @@ if (!app.requestSingleInstanceLock()) app.quit();
 let window, currentCatalog, sessionToken = '', settings, settingsFile, lastJobFile;
 const engine = new Transfer();
 const root = app.isPackaged ? process.resourcesPath : path.resolve(__dirname, '..');
-const defaults = { outputDir: path.join(os.homedir(),'Downloads','HuggingFace'), quant:'', connections:16, disableIPv6:false, aria2Path:'' };
+const defaults = { outputDir: path.join(os.homedir(),'Downloads','HuggingFace'), quant:'', connections:16, disableIPv6:true, aria2Path:'' };
 function readJSON(file, fallback) { try { return JSON.parse(fs.readFileSync(file,'utf8').replace(/^\uFEFF/,'')); } catch { return fallback; } }
 function saveJSON(file, value) { fs.mkdirSync(path.dirname(file), { recursive:true }); fs.writeFileSync(file + '.tmp', JSON.stringify(value,null,2)); fs.renameSync(file + '.tmp',file); }
 function status() {
@@ -35,6 +35,7 @@ function handle(name, fn) {
 app.whenReady().then(() => {
   settingsFile = path.join(app.getPath('userData'),'settings.json'); lastJobFile = path.join(app.getPath('userData'),'last-download.json');
   settings = { ...defaults, ...readJSON(settingsFile,{}) };
+  settings.disableIPv6 = true;
   if (!fs.existsSync(settingsFile) && !testing) {
     const terminalSettings = readJSON(path.join(process.env.LOCALAPPDATA || os.homedir(),'HuggingFaceDownloader','settings.json'),{});
     settings.outputDir = terminalSettings.outputDir || defaults.outputDir; settings.quant = terminalSettings.quant || '';
@@ -74,7 +75,7 @@ app.whenReady().then(() => {
   handle('lm-folder', () => path.join(os.homedir(),'.lmstudio','models'));
   handle('save-settings', value => {
     if (engine.busy) throw new Error('Pause the download before changing settings.');
-    const next = { outputDir:String(value.outputDir || settings.outputDir), quant:String(value.quant ?? settings.quant), connections:Number(value.connections ?? settings.connections), disableIPv6:!!(value.disableIPv6 ?? settings.disableIPv6), aria2Path:String(value.aria2Path ?? settings.aria2Path) };
+    const next = { outputDir:String(value.outputDir || settings.outputDir), quant:String(value.quant ?? settings.quant), connections:Number(value.connections ?? settings.connections), disableIPv6:true, aria2Path:String(value.aria2Path ?? settings.aria2Path) };
     if (!path.isAbsolute(next.outputDir)) throw new Error('Choose an absolute download folder.');
     if (!Number.isInteger(next.connections) || next.connections < 1 || next.connections > 16) throw new Error('Connections must be between 1 and 16.');
     if (next.aria2Path) core.findAria(next.aria2Path,root);

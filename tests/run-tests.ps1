@@ -79,12 +79,12 @@ Assert (@($live | Where-Object { (Get-CompanionKind $_.path) -eq 'MTP' }).Count 
 Assert (@($live | Where-Object { (Get-CompanionKind $_.path) -eq 'vision' }).Count -gt 0) 'Fixture vision detection'
 Assert (@($liveBundles | Where-Object { $_.Quant -eq 'BF16' -and $_.Files.Count -eq 2 -and $_.Complete }).Count -eq 1) 'Fixture split grouping'
 $script:TransferConnections = 4
-$script:TransferDisableIPv6 = $false
+$script:TransferDisableIPv6 = $true
 $transferArgs = @(Get-Aria2Args '')
 Assert ($transferArgs[1] -eq '4' -and $transferArgs[3] -eq '4') 'Configurable connections'
-Assert ('--disable-ipv6=true' -notin $transferArgs) 'IPv6 available by default'
-$script:TransferDisableIPv6 = $true
-Assert ('--disable-ipv6=true' -in @(Get-Aria2Args '')) 'Optional IPv4 only mode'
+Assert ('--disable-ipv6=true' -in $transferArgs) 'IPv4-only transfer mode'
+$script:TransferDisableIPv6 = $false
+Assert ('--disable-ipv6=true' -in @(Get-Aria2Args '')) 'IPv4-only mode cannot be disabled'
 $settings = Get-DownloaderSettings
 $settings.outputDir = Join-Path ([IO.Path]::GetTempPath()) 'model-downloads'
 Save-DownloaderSettings $settings

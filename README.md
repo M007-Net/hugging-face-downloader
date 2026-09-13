@@ -35,7 +35,7 @@ The interface uses numbered keyboard choices. Press Enter to accept a highlighte
 .\hf-download.ps1 -Url 'owner/repository' -OutputDir '.\downloads'
 .\hf-download.ps1 -Connections 8
 .\hf-download.ps1 -Aria2Path 'D:\Tools\aria2c.exe'
-.\hf-download.ps1 -DisableIPv6
+.\hf-download.ps1 -DisableIPv6  # retained for compatibility; IPv4-only is always enforced
 ```
 
 If local execution policy blocks the script, use the included `.cmd` launcher, which sets a policy override for that process only. It does not change system policy.
@@ -49,7 +49,7 @@ If local execution policy blocks the script, use the included `.cmd` launcher, w
 | Saved folder | Used when neither override is supplied. |
 | First-run folder | Defaults to `Downloads\HuggingFace` under the current user's profile; you can choose another folder. |
 | `-Connections` | Connections per file, from 1 to 16; default 16. |
-| `-DisableIPv6` | Optional IPv4-only operation; IPv6 is allowed by default. |
+| `-DisableIPv6` | Legacy compatibility switch. IPv4-only operation is always enforced. |
 | `-Aria2Path` | Explicit executable path; otherwise checks `bin/`, PATH, and common Windows package locations. |
 | `-SettingsPath` | Alternative settings JSON path, useful for a portable installation. |
 
@@ -61,7 +61,7 @@ For a portable settings file:
 .\hf-download.ps1 -SettingsPath '.\settings.local.json' -OutputDir '.\downloads'
 ```
 
-Authentication checks `HF_TOKEN`, then legacy `HUGGING_FACE_HUB_TOKEN` / `HUGGINGFACE_TOKEN`, then the local token file. Token-file discovery respects `HF_TOKEN_PATH`, `HF_HOME`, and `XDG_CACHE_HOME`, with the standard user cache as fallback. Configure credentials locally; do not put them in the project.
+Authentication checks `HF_TOKEN`, then legacy `HUGGING_FACE_HUB_TOKEN` / `HUGGINGFACE_TOKEN`, then the local token file. Token-file discovery respects `HF_TOKEN_PATH`, `HF_HOME`, and `XDG_CACHE_HOME`, with the standard user cache as fallback. Configure credentials locally; do not put them in the project. All aria2 requests explicitly disable IPv6; the desktop Settings page shows this as enforced.
 
 ## File selection and layout
 
