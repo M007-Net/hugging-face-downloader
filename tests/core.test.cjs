@@ -31,6 +31,21 @@ test('real repository fixture groups shards and keeps companions separate',()=>{
   assert.equal(core.bundles([full.files[0]])[0].complete,false);
   assert.ok(c.bundles.every(b=>!core.companionKind(b.name)));
 });
+test('Gemma 4 31B repository names map to quant, vision, and MTP choices',()=>{
+  const names = [
+    'gemma-4-31B-it-UD-Q4_K_XL.gguf', 'gemma-4-31B-it-UD-IQ3_XXS.gguf',
+    'gemma-4-31B-it-Q4_K_M.gguf', 'mmproj-F16.gguf', 'mtp-gemma-4-31B-it.gguf'
+  ];
+  assert.equal(core.quantName(names[0]), 'UD-Q4_K_XL');
+  assert.equal(core.quantName(names[1]), 'UD-IQ3_XXS');
+  assert.equal(core.bits(core.quantName(names[2])), 4);
+  assert.equal(core.companionKind(names[3]), 'vision');
+  assert.equal(core.companionKind(names[4]), 'mtp');
+  const catalog = core.catalog(core.parseLink('unsloth/gemma-4-31B-it-GGUF'), names.map(path => ({ path, size: 100 })));
+  assert.ok(catalog.bundles.some(bundle => bundle.quant === 'UD-Q4_K_XL'));
+  assert.equal(catalog.vision.length, 1);
+  assert.equal(catalog.mtp.length, 1);
+});
 test('folder catalog still offers root-level companions',()=>{
   const c=core.catalog(core.parseLink('https://huggingface.co/example/repo/tree/main/BF16'),fixture.filter(f=>f.type==='file'));
   assert.equal(c.files.length,2);assert.equal(c.mtp.length,4);assert.ok(c.vision.length);
@@ -39,6 +54,12 @@ test('pagination retrieves all files and refuses third-party next-page hosts',as
   let count=0;const fetcher=async()=>({ok:true,headers:new Headers(count++===0?{link:'<https://huggingface.co/api/models/owner/repo/tree/main?cursor=2>; rel="next"'}:{}),json:async()=>[{type:'file',path:`model-Q${count}_K.gguf`,size:100}]});
   const c=await core.listRepo('owner/repo','',fetcher);assert.equal(c.files.length,2);
   await assert.rejects(core.listRepo('owner/repo','',async()=>({ok:true,headers:new Headers({link:'<https://example.com/steal>; rel="next"'}),json:async()=>[]})),/Unexpected/);
+});
+test('follows same-site API redirects but never sends tokens off Hugging Face',async()=>{
+  let calls=0; const seen=[];
+  const fetcher=async(url,options)=>{seen.push({url:String(url),redirect:options.redirect,auth:options.headers.Authorization});calls++; if(calls===1)return {status:307,headers:new Headers({location:'/api/models/owner/repo/tree/main?recursive=true'}),ok:false}; return {status:200,ok:true,headers:new Headers(),json:async()=>[{type:'file',path:'model-Q4_K.gguf',size:100}]};};
+  const c=await core.listRepo('owner/repo','secret',fetcher); assert.equal(c.files.length,1); assert.equal(calls,2); assert.deepEqual(seen.map(x=>x.redirect),['manual','manual']); assert.ok(seen.every(x=>x.auth==='Bearer secret'));
+  await assert.rejects(core.listRepo('owner/repo','secret',async(_url,options)=>({status:302,ok:false,headers:new Headers({location:'https://evil.example/steal'})})),/Unexpected/);
 });
 test('access errors are actionable and download URLs escape filenames',async()=>{
   await assert.rejects(core.listRepo('owner/repo','',async()=>({ok:false,status:403})),/read token/);
