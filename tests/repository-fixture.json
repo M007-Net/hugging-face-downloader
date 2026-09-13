@@ -1,0 +1,187 @@
+[
+  {
+    "type": "directory",
+    "path": "BF16",
+    "size": 0
+  },
+  {
+    "type": "directory",
+    "path": "MTP",
+    "size": 0
+  },
+  {
+    "type": "file",
+    "path": ".gitattributes",
+    "size": 3992
+  },
+  {
+    "type": "file",
+    "path": "BF16/gemma-4-31B-it-BF16-00001-of-00002.gguf",
+    "size": 49950156960
+  },
+  {
+    "type": "file",
+    "path": "BF16/gemma-4-31B-it-BF16-00002-of-00002.gguf",
+    "size": 11463033568
+  },
+  {
+    "type": "file",
+    "path": "MTP/README.md",
+    "size": 2098
+  },
+  {
+    "type": "file",
+    "path": "MTP/mtp-gemma-4-31B-it-BF16.gguf",
+    "size": 954843264
+  },
+  {
+    "type": "file",
+    "path": "MTP/mtp-gemma-4-31B-it-F16.gguf",
+    "size": 954843264
+  },
+  {
+    "type": "file",
+    "path": "MTP/mtp-gemma-4-31B-it-Q8_0.gguf",
+    "size": 514687104
+  },
+  {
+    "type": "file",
+    "path": "README.md",
+    "size": 28499
+  },
+  {
+    "type": "file",
+    "path": "config.json",
+    "size": 4702
+  },
+  {
+    "type": "file",
+    "path": "gemma-4-31B-it-IQ4_NL.gguf",
+    "size": 17287670720
+  },
+  {
+    "type": "file",
+    "path": "gemma-4-31B-it-IQ4_XS.gguf",
+    "size": 16372460480
+  },
+  {
+    "type": "file",
+    "path": "gemma-4-31B-it-Q3_K_M.gguf",
+    "size": 14736608192
+  },
+  {
+    "type": "file",
+    "path": "gemma-4-31B-it-Q3_K_S.gguf",
+    "size": 13210856384
+  },
+  {
+    "type": "file",
+    "path": "gemma-4-31B-it-Q4_0.gguf",
+    "size": 17338248128
+  },
+  {
+    "type": "file",
+    "path": "gemma-4-31B-it-Q4_1.gguf",
+    "size": 19118091200
+  },
+  {
+    "type": "file",
+    "path": "gemma-4-31B-it-Q4_K_M.gguf",
+    "size": 18323733440
+  },
+  {
+    "type": "file",
+    "path": "gemma-4-31B-it-Q4_K_S.gguf",
+    "size": 17399835584
+  },
+  {
+    "type": "file",
+    "path": "gemma-4-31B-it-Q5_K_M.gguf",
+    "size": 21658401728
+  },
+  {
+    "type": "file",
+    "path": "gemma-4-31B-it-Q5_K_S.gguf",
+    "size": 21124672448
+  },
+  {
+    "type": "file",
+    "path": "gemma-4-31B-it-Q6_K.gguf",
+    "size": 25201486784
+  },
+  {
+    "type": "file",
+    "path": "gemma-4-31B-it-Q8_0.gguf",
+    "size": 32635677632
+  },
+  {
+    "type": "file",
+    "path": "gemma-4-31B-it-UD-IQ2_M.gguf",
+    "size": 10752820160
+  },
+  {
+    "type": "file",
+    "path": "gemma-4-31B-it-UD-IQ2_XXS.gguf",
+    "size": 8534295488
+  },
+  {
+    "type": "file",
+    "path": "gemma-4-31B-it-UD-IQ3_XXS.gguf",
+    "size": 11837782976
+  },
+  {
+    "type": "file",
+    "path": "gemma-4-31B-it-UD-Q2_K_XL.gguf",
+    "size": 11774991296
+  },
+  {
+    "type": "file",
+    "path": "gemma-4-31B-it-UD-Q3_K_XL.gguf",
+    "size": 15380222912
+  },
+  {
+    "type": "file",
+    "path": "gemma-4-31B-it-UD-Q4_K_XL.gguf",
+    "size": 18822970304
+  },
+  {
+    "type": "file",
+    "path": "gemma-4-31B-it-UD-Q5_K_XL.gguf",
+    "size": 21890429888
+  },
+  {
+    "type": "file",
+    "path": "gemma-4-31B-it-UD-Q6_K_XL.gguf",
+    "size": 27521338304
+  },
+  {
+    "type": "file",
+    "path": "gemma-4-31B-it-UD-Q8_K_XL.gguf",
+    "size": 35020041152
+  },
+  {
+    "type": "file",
+    "path": "imatrix_unsloth.gguf_file",
+    "size": 13753952
+  },
+  {
+    "type": "file",
+    "path": "mmproj-BF16.gguf",
+    "size": 1200726496
+  },
+  {
+    "type": "file",
+    "path": "mmproj-F16.gguf",
+    "size": 1198957024
+  },
+  {
+    "type": "file",
+    "path": "mmproj-F32.gguf",
+    "size": 2302996960
+  },
+  {
+    "type": "file",
+    "path": "mtp-gemma-4-31B-it.gguf",
+    "size": 514687104
+  }
+]
