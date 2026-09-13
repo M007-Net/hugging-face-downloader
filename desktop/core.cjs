@@ -70,7 +70,21 @@ async function listRepo(input, token = '', fetcher = fetch) {
     if (++pages > 100) throw new Error('This repository is too large to list completely. Use a smaller repository.');
     const url = new URL(next);
     if (url.origin !== 'https://huggingface.co') throw new Error('Unexpected file-list destination.');
-    const response = await fetcher(url, { headers: { 'User-Agent': 'HuggingFaceDownloader/0.2', ...(token ? { Authorization: `Bearer ${token}` } : {}) }, signal: AbortSignal.timeout(30000), redirect: 'error' });
+    const requestOptions = { headers: { 'User-Agent': 'HuggingFaceDownloader/0.2', ...(token ? { Authorization: `Bearer ${token}` } : {}) }, signal: AbortSignal.timeout(30000), redirect: 'manual' };
+    let response;
+    let requestUrl = url;
+    for (let redirectCount = 0; ; redirectCount++) {
+      const parsedRequestUrl = new URL(requestUrl);
+      if (parsedRequestUrl.origin !== 'https://huggingface.co') throw new Error('Unexpected file-list destination.');
+      response = await fetcher(parsedRequestUrl, requestOptions);
+      if (![301, 302, 303, 307, 308].includes(response.status)) break;
+      if (redirectCount >= 5) throw new Error('Hugging Face redirected the file listing too many times.');
+      const location = response.headers.get('location');
+      if (!location) throw new Error('Hugging Face returned an incomplete redirect.');
+      const nextUrl = new URL(location, parsedRequestUrl);
+      if (nextUrl.origin !== 'https://huggingface.co') throw new Error('Unexpected file-list destination.');
+      requestUrl = nextUrl.toString();
+    }
     if (!response.ok) throw new Error(response.status === 401 || response.status === 403 ? 'Access denied. Add a read token in Settings and accept any model access terms on Hugging Face.' : response.status === 404 ? 'Repository or branch not found. Check the link.' : `Hugging Face returned HTTP ${response.status}. Try again shortly.`);
     const page = await response.json();
     if (!Array.isArray(page)) throw new Error('Unexpected repository listing.');
