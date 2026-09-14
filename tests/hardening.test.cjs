@@ -83,3 +83,27 @@ test('the download engine must be a local executable, not a network one', () => 
   // And the refusal happens before anything touches the filesystem or spawns.
   assert.throws(() => findAria(`${B}${B}attacker.example${B}share${B}aria2c.exe`, '.'), /local drive/);
 });
+
+// npm test names its files explicitly rather than globbing, because `node --test`
+// only learned to expand globs in Node 21 and cmd.exe never expands them — on the
+// Node version this project claims to support, `tests/*.test.cjs` reached node as a
+// literal string. The cost of listing files is that a new one can be added and
+// silently never run, which is worse than a noisy failure. This catches that.
+test('every test file is actually listed in the npm test script', () => {
+  const fs = require('node:fs');
+  const path = require('node:path');
+  const root = path.join(__dirname, '..');
+  const script = require(path.join(root, 'package.json')).scripts.test;
+  const onDisk = fs.readdirSync(__dirname).filter(f => f.endsWith('.test.cjs')).sort();
+
+  assert.ok(onDisk.length > 0, 'expected to find test files on disk');
+  const missing = onDisk.filter(f => !script.includes(f));
+  assert.deepEqual(missing, [], `these test files exist but npm test never runs them: ${missing.join(', ')}`);
+
+  // And nothing listed should have been deleted or renamed.
+  const listed = script.split(/\s+/).filter(a => a.endsWith('.test.cjs')).map(a => path.basename(a)).sort();
+  const gone = listed.filter(f => !onDisk.includes(f));
+  assert.deepEqual(gone, [], `npm test names files that no longer exist: ${gone.join(', ')}`);
+
+  assert.ok(!script.includes('*'), 'no glob: it does not expand on the oldest supported Node');
+});

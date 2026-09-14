@@ -130,6 +130,11 @@ terminal script — are covered; where a fix applies to only one, it says so.
   commit: no jobs, and it appeared in Actions under its file path instead of its name.
   The interpreter is now chosen inside `run`, which does take expressions. The suite
   still runs under both Windows PowerShell 5.1 and PowerShell 7.
+- **`npm test` found no tests on the Node version this project claims to support.**
+  The script globbed `tests/*.test.cjs`, but `node --test` only expands globs from
+  Node 21 and cmd.exe never does, so on Node 20 the glob reached node as a literal
+  path. The files are named explicitly now, and a test asserts the list matches
+  what is on disk so a new file cannot be added and silently never run.
 
 - The `repository` field now names `M007-Net/hugging-face-downloader`, so the
   in-app updater is armed rather than switched off. While the repository is

@@ -12,7 +12,7 @@
   "main": "desktop/main.cjs",
   "scripts": {
     "start": "electron .",
-    "test": "node --test tests/*.test.cjs",
+    "test": "node --test tests/core.test.cjs tests/transfer.test.cjs tests/updater.test.cjs tests/hardening.test.cjs",
     "test:terminal": "powershell -NoProfile -ExecutionPolicy Bypass -File tests/run-tests.ps1",
     "icon": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/icon.ps1",
     "qa": "node tests/ui-static.cjs",
