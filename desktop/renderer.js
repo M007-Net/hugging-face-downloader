@@ -48,11 +48,33 @@ function updateBanner() {
 }
 function render() {
   if (!state.status) return;
-  document.querySelectorAll('[data-page]').forEach(b=>b.classList.toggle('active', b.dataset.page===state.page));
+  // A CSS class alone tells a screen reader nothing about which page is open.
+  document.querySelectorAll('[data-page]').forEach(b=>{const on=b.dataset.page===state.page;b.classList.toggle('active',on);if(on)b.setAttribute('aria-current','page');else b.removeAttribute('aria-current');});
   $('breadcrumb').textContent={new:'New download',downloads:'Downloads',settings:'Settings'}[state.page];
   $('version').textContent='v'+state.status.version; $('engine-pill').textContent=state.status.aria?'● aria2 found':'Set up aria2'; $('engine-pill').classList.toggle('ready',!!state.status.aria);
   $('queue-badge').textContent=active()?'1':'';
+  // Replacing #app destroys every node in it, so whatever had focus loses it and focus
+  // falls back to <body>. Ticking five checkboxes meant tabbing from the top of the page
+  // five times, and the file list scrolled back to the top each time. Remember where the
+  // user was and put them back.
+  const before=document.activeElement;
+  const focusKey=before&&$('app')&&$('app').contains(before)?(before.id||(before.dataset&&before.dataset.file?'file:'+before.dataset.file:'')):'';
+  const caret=before&&typeof before.selectionStart==='number'?[before.selectionStart,before.selectionEnd]:null;
+  const scroll=document.querySelector('.file-list')?.scrollTop||0;
   $('app').innerHTML=updateBanner()+(state.page==='new'?newPage():state.page==='downloads'?downloadsPage():settingsPage());
+  const list=document.querySelector('.file-list');
+  if (list && scroll) list.scrollTop=scroll;
+  if (focusKey) {
+    const again=focusKey.startsWith('file:')
+      ? $('app').querySelector(`[data-file="${CSS.escape(focusKey.slice(5))}"]`)
+      : document.getElementById(focusKey);
+    if (again) {
+      again.focus({ preventScroll:true });
+      if (caret && typeof again.setSelectionRange === 'function') {
+        try { again.setSelectionRange(caret[0], caret[1]); } catch { /* not a text input */ }
+      }
+    }
+  }
 }
 function newPage() {
   const c=state.catalog; const selected=chosen(); const total=selected.reduce((n,f)=>n+f.size,0);
@@ -81,8 +103,8 @@ function companion(key,title,explanation) {
   return `<div class="companion"><label class="check"><input type="checkbox" data-companion="${key}" ${state[key]?'checked':''} ${!list.length?'disabled':''}>${title}<span class="tag ${list.length?'':'neutral'}">${list.length?'FILENAME MATCH':'NOT FOUND'}</span></label><small>${list.length?explanation+' Compatibility is not verified.':'No separate file detected here. It may be embedded or hosted elsewhere.'}</small>${state[key]?`<select aria-label="${title} file" data-extra="${key}">${list.map(b=>option(b.name,`${b.name} · ${size(b.size)}${b.complete?'':' · missing parts'}`,state[key])).join('')}</select>`:''}</div>`;
 }
 function downloadsPage() {
-  const j=state.job; const total=j?.files.reduce((n,f)=>n+f.size,0)||0; const done=j?.files.reduce((n,f)=>n+f.completed,0)||0; const speed=j?.files.reduce((n,f)=>n+f.speed,0)||0; const pct=total?Math.min(100,done/total*100):0;
-  return `<div class="heading"><div class="eyebrow">DOWNLOADS</div><h1>${j?.status==='complete'?'Download complete':'Downloads'}</h1><p>Pause or resume downloads started by this app.</p></div><div class="layout"><div class="flow">${j?`<div class="stats"><div class="stat"><span>Progress</span><strong>${pct.toFixed(1)}%</strong></div><div class="stat"><span>Download speed</span><strong>${size(speed)}/s</strong></div><div class="stat"><span>Completed files</span><strong>${j.files.filter(f=>f.status==='complete').length} / ${j.files.length}</strong></div></div><section class="card"><div class="section-title"><h2>${esc(j.info.repo)}</h2><span class="transfer-status">${esc(j.status)}</span></div>${j.error?`<div class="error">${esc(j.error)}</div>`:''}<div class="progress-track"><progress max="100" value="${pct}" aria-label="Overall download progress"></progress></div><small>${size(done)} of ${size(total)}</small><div class="links-row">${active()?'<button id="pause">Pause download</button>':j.status!=='complete'?'<button class="primary" id="resume">Resume / retry</button>':''}<button id="open-folder">Open download folder</button></div><p class="mono">${esc(j.destination)}</p>${j.files.map(f=>`<div class="transfer-file"><div class="row"><span>${esc(f.path)}</span><span class="transfer-status${f.status==='error'?' failed':''}">${esc(f.status)}</span></div><small>${size(f.completed)} / ${size(f.size)}${f.speed?' · '+size(f.speed)+'/s':''}</small>${f.error?`<small class="failed">${esc(f.error)}</small>`:''}</div>`).join('')}</section>`:'<section class="empty"><div class="empty-symbol">↓</div><h2>No downloads yet</h2><p>Start with a model link. You can review every file before downloading.</p><button class="primary field-gap" data-page="new">Find a model</button></section>'}</div>${help('downloads')}</div>`;
+  const j=state.job; const total=j?.files.reduce((n,f)=>n+f.size,0)||0; const done=j?.files.reduce((n,f)=>n+f.completed,0)||0; const speed=j?.files.reduce((n,f)=>n+f.speed,0)||0; const pct=total?Math.min(100,done/total*100):null; // null = no sizes reported, so a percentage would be a lie
+  return `<div class="heading"><div class="eyebrow">DOWNLOADS</div><h1>${j?.status==='complete'?'Download complete':'Downloads'}</h1><p>Pause or resume downloads started by this app.</p></div><div class="layout"><div class="flow">${j?`<div class="stats"><div class="stat"><span>Progress</span><strong>${pct===null?size(done)+" downloaded":pct.toFixed(1)+"%"}</strong></div><div class="stat"><span>Download speed</span><strong>${size(speed)}/s</strong></div><div class="stat"><span>Completed files</span><strong>${j.files.filter(f=>f.status==='complete').length} / ${j.files.length}</strong></div></div><section class="card"><div class="section-title"><h2>${esc(j.info.repo)}</h2><span class="transfer-status">${esc(j.status)}</span></div>${j.error?`<div class="error">${esc(j.error)}</div>`:''}<div class="progress-track"><progress max="100" value="${pct}" aria-label="Overall download progress"></progress></div><small>${size(done)} of ${size(total)}</small><div class="links-row">${active()?'<button id="pause">Pause download</button>':j.status!=='complete'?'<button class="primary" id="resume">Resume / retry</button>':''}<button id="open-folder">Open download folder</button></div><p class="mono">${esc(j.destination)}</p>${j.files.map(f=>`<div class="transfer-file"><div class="row"><span>${esc(f.path)}</span><span class="transfer-status${f.status==='error'?' failed':''}">${esc(f.status)}</span></div><small>${size(f.completed)} / ${size(f.size)}${f.speed?' · '+size(f.speed)+'/s':''}</small>${f.error?`<small class="failed">${esc(f.error)}</small>`:''}</div>`).join('')}</section>`:'<section class="empty"><div class="empty-symbol">↓</div><h2>No downloads yet</h2><p>Start with a model link. You can review every file before downloading.</p><button class="primary field-gap" data-page="new">Find a model</button></section>'}</div>${help('downloads')}</div>`;
 }
 function updateSettings() {
   const u=state.update;
@@ -131,7 +153,11 @@ document.addEventListener('click',e=>{const t=e.target.closest('button');if(!t)r
   if(t.id==='aria-help')await api.ariaHelp();
   if(t.id==='clear-files'){state.manual.clear();render();}
   if(t.id==='select-visible'){const visible=state.catalog.files.filter(f=>f.path.toLowerCase().includes(state.search.toLowerCase()));for(const chosen of visible){const key=chosen.path.replace(/-\d{5}-of-\d{5}(?=\.gguf$)/i,'');for(const f of state.catalog.files.filter(f=>f.path.replace(/-\d{5}-of-\d{5}(?=\.gguf$)/i,'')===key))state.manual.add(f.path);}render();}
-  if(t.id==='download'){if(state.remember&&state.mode==='quant')state.status=await api.saveSettings({quant:state.quant});state.job=await api.start(chosen().map(f=>f.path));state.page='downloads';render();}
+  // Disabled synchronously, before the first await. A second click used to reach
+  // saveSettings while the first click's download was already running, and came back as
+  // "Pause the download before changing settings" - a settings error for a download that
+  // had in fact started correctly.
+  if(t.id==='download'){t.disabled=true;if(state.remember&&state.mode==='quant')state.status=await api.saveSettings({quant:state.quant});state.job=await api.start(chosen().map(f=>f.path));state.page='downloads';render();}
   if(t.id==='pause'){t.disabled=true;t.textContent='Pausing…';state.job=await api.pause();render();}
   if(t.id==='resume'){state.job=await api.resume();render();}
   if(t.id==='open-folder')await api.openFolder();

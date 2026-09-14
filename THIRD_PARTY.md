@@ -7,7 +7,7 @@ keep their own upstream licenses, which are unaffected by that.
 
 | Component | How it is obtained | License and source |
 | --- | --- | --- |
-| aria2 (`aria2c.exe`) | Not shipped with this project. The tool looks for it on `PATH` and in the usual install locations (winget, Chocolatey, Scoop, `Program Files`); if it is missing, it offers to install it through **winget** (`aria2.aria2`). No binary is downloaded directly by this project. | GPL-2.0-or-later, with an OpenSSL linking exception; https://github.com/aria2/aria2 |
+| aria2 (`aria2c.exe`) | Not shipped with this project. The tool looks for it on `PATH` and in the usual install locations (winget, Chocolatey, Scoop, `Program Files`); if it is missing, the **terminal script** offers to install it through **winget** (`aria2.aria2`) after asking; the **desktop app** installs nothing and only points you at the aria2 releases page. No binary is downloaded directly by this project. | GPL-2.0-or-later, with an OpenSSL linking exception; https://github.com/aria2/aria2 |
 
 aria2 does all of the actual transferring. This project only decides what to ask
 for and checks what comes back, so aria2 is invoked as a separate process rather
@@ -37,7 +37,7 @@ None of these are shipped inside the installer except Electron itself.
 | `huggingface.co` | Listing a repository, probing file sizes, starting a download | A bearer token, if one is configured |
 | Hugging Face CDN (`cdn-lfs*.huggingface.co` and similar) | Following a download redirect | The signed URL only. The authorization header is removed before the redirect is followed. |
 | `api.github.com` | Update checks, if the build has a repository configured | Nothing but the request itself. No token, no identifier, no version reporting beyond what the URL implies. |
-| `github.com` and `objects.githubusercontent.com` | Downloading an update installer, only after you click | Nothing but the request itself. |
+| `github.com`, `objects.githubusercontent.com`, and `release-assets.githubusercontent.com` | Downloading an update installer, only after you click. GitHub redirects release downloads to its object storage, and `release-assets.githubusercontent.com` is the host that currently answers, so it is the one that shows up in a proxy log. | Nothing but the request itself. |
 
 Nothing else is contacted. There is no telemetry and no analytics. The update
 check is the only outbound request not caused by something you asked for, it

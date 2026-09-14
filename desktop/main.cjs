@@ -29,8 +29,17 @@ const root = app.isPackaged ? process.resourcesPath : path.resolve(__dirname, '.
 const defaults = { outputDir: path.join(os.homedir(),'Downloads','HuggingFace'), quant:'', connections:16, disableIPv6:true, aria2Path:'' };
 function readJSON(file, fallback) { try { return JSON.parse(fs.readFileSync(file,'utf8').replace(/^\uFEFF/,'')); } catch { return fallback; } }
 function saveJSON(file, value) { fs.mkdirSync(path.dirname(file), { recursive:true }); fs.writeFileSync(file + '.tmp', JSON.stringify(value,null,2)); fs.renameSync(file + '.tmp',file); }
+// path.isAbsolute() alone says yes to "\\\\attacker.example\\share". Both mkdirSync and
+// aria2's --dir would then touch that remote share, and Windows attempts NTLM against it
+// without asking, handing the user's account name and a challenge response to whoever
+// runs it. A download folder is a local drive.
+function localDirectory(value) {
+  if (typeof value !== 'string' || value.length > 4096) return false;
+  if (/[\u0000-\u001f]/.test(value)) return false;
+  return /^[A-Za-z]:[\\/]/.test(value);
+}
 function cleanSettings(value = {}) {
-  const outputDir = typeof value.outputDir === 'string' && path.isAbsolute(value.outputDir) ? value.outputDir : defaults.outputDir;
+  const outputDir = typeof value.outputDir === 'string' && localDirectory(value.outputDir) ? value.outputDir : defaults.outputDir;
   const connections = Number.isInteger(Number(value.connections)) && Number(value.connections) >= 1 && Number(value.connections) <= 16 ? Number(value.connections) : defaults.connections;
   return { outputDir, quant:typeof value.quant === 'string' ? value.quant.slice(0,128) : '', connections, disableIPv6:true, aria2Path:typeof value.aria2Path === 'string' ? value.aria2Path : '' };
 }
@@ -65,12 +74,16 @@ if (primaryInstance) app.whenReady().then(() => {
     const terminalSettings = readJSON(path.join(process.env.LOCALAPPDATA || os.homedir(),'HuggingFaceDownloader','settings.json'),{});
     settings.outputDir = terminalSettings.outputDir || defaults.outputDir; settings.quant = terminalSettings.quant || '';
   }
-  // readJSON only guards against unparseable files. A job saved by a different
-  // version can parse fine and still be the wrong shape, and anything thrown
-  // here aborts the rest of this callback, leaving the app with no window at
-  // all, so require the shape before trusting it.
+  // readJSON only guards against an unparseable file. A job saved by a different
+  // version can parse fine and still be the wrong shape, and anything thrown here
+  // aborts the rest of this callback, leaving the app with no window at all. The
+  // check used to look only at the top level, so a files array holding a null or a
+  // {} passed it and then threw inside safePath on resume as a raw TypeError.
   const saved = readJSON(lastJobFile,null);
-  engine.job = saved && Array.isArray(saved.files) && typeof saved.destination === 'string' && saved.info ? saved : null;
+  const wellFormed = saved && Array.isArray(saved.files) && saved.files.length
+    && typeof saved.destination === 'string' && saved.info && typeof saved.info === 'object'
+    && saved.files.every(f => f && typeof f.path === 'string' && f.path && Number.isFinite(Number(f.size)));
+  engine.job = wellFormed ? saved : null;
   if (engine.job && engine.job.status !== 'complete') { engine.job.status = 'paused'; engine.job.files.forEach(f => { if (f && f.status !== 'complete') f.status = 'waiting'; }); }
   const uiFile = path.join(__dirname,'index.html');
   window = new BrowserWindow({ width:1360, height:950, minWidth:1000, minHeight:720, backgroundColor:'#101416', title:'Hugging Face Downloader', autoHideMenuBar:true, show:false,
@@ -106,7 +119,7 @@ if (primaryInstance) app.whenReady().then(() => {
   handle('save-settings', value => {
     if (engine.busy) throw new Error('Pause the download before changing settings.');
     const next = { outputDir:String(value.outputDir || settings.outputDir), quant:String(value.quant ?? settings.quant).slice(0,128), connections:Number(value.connections ?? settings.connections), disableIPv6:true, aria2Path:String(value.aria2Path ?? settings.aria2Path) };
-    if (!path.isAbsolute(next.outputDir)) throw new Error('Choose an absolute download folder.');
+    if (!localDirectory(next.outputDir)) throw new Error('Choose a download folder on a local drive, starting with a drive letter such as C:\\.');
     if (!Number.isInteger(next.connections) || next.connections < 1 || next.connections > 16) throw new Error('Connections must be between 1 and 16.');
     if (next.aria2Path) core.findAria(next.aria2Path,root);
     if (typeof value.token === 'string') sessionToken = core.validToken(value.token);
@@ -143,8 +156,13 @@ if (primaryInstance) app.whenReady().then(() => {
       // Installers are ~90MB each. Keep only the one being fetched rather than
       // growing a pile of them in the user's profile.
       try { fs.rmSync(folder, { recursive: true, force: true }); } catch { /* in use; the download still works */ }
-      // The asset name comes from GitHub, so it never becomes part of a path.
-      const target = path.join(folder, `Hugging-Face-Downloader-Setup-${update.result.version}.exe`);
+      // The asset name comes from GitHub, so it never becomes part of a path. Neither
+      // does the version: it is server data too, and it is checked here as well as at
+      // the parser, so a tag can never steer the write out of this folder.
+      const version = String(update.result.version || '');
+      if (!/^[0-9A-Za-z.+-]{1,64}$/.test(version)) throw new Error('That release advertises a version number this app will not turn into a filename.');
+      const target = path.join(folder, `Hugging-Face-Downloader-Setup-${version}.exe`);
+      if (path.dirname(path.resolve(target)) !== path.resolve(folder)) throw new Error('Refusing an update filename that points outside the updates folder.');
       let lastSent = 0;
       const saved = await updater.downloadAsset(asset, target, { onProgress: received => {
         if (Date.now() - lastSent < 250) return;
@@ -164,6 +182,16 @@ if (primaryInstance) app.whenReady().then(() => {
       buttons:['Cancel','Run the installer'], defaultId:0, cancelId:0
     });
     if (choice.response !== 1) return update;
+    // Checked again here, after the user has read the dialog and decided. Between the
+    // download and this moment the file has been sitting at a predictable path.
+    const expected = update.result?.asset?.sha256;
+    const actual = await updater.hashFile(update.downloaded).catch(() => '');
+    if (!expected || actual !== expected) {
+      try { fs.rmSync(update.downloaded, { force: true }); } catch { /* already gone */ }
+      update = { ...update, state:'idle', received:0, downloaded:'', error:'The downloaded installer changed after it was verified, so it was deleted. Check for the update again.' };
+      publishUpdate();
+      throw new Error('The downloaded installer no longer matches the published SHA-256. It was deleted rather than run.');
+    }
     const error = await shell.openPath(update.downloaded);
     if (error) throw new Error(error);
     // The dialog above says this app closes, and NSIS cannot replace files that

@@ -7,7 +7,12 @@ the same idea: a PowerShell script (`hf-download.ps1`) and an Electron app
 ## Getting set up
 
 You need Node 20 or newer and Windows PowerShell 5.1 (which ships with Windows).
-aria2 is fetched on first use if it is not already on `PATH`.
+
+aria2 is **not** bundled and nothing installs it for you: install it separately
+(`winget install aria2.aria2`) before running the app. The desktop app only tells you
+it is missing and links to the aria2 releases page; the terminal script is the one
+that offers to run winget for you, and only after asking. The test suites need none
+of this — they use a stub and start no downloads.
 
 ```
 npm ci
