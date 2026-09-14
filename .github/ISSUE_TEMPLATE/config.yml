@@ -1,0 +1,10 @@
+blank_issues_enabled: false
+contact_links:
+  # GitHub adds its own "Report a vulnerability" entry here once private
+  # reporting is enabled for the repository. This link is the instructions.
+  - name: Security problem
+    url: https://docs.github.com/en/code-security/security-advisories/guidance-on-reporting-and-writing-information-about-vulnerabilities/privately-reporting-a-security-vulnerability
+    about: Report security problems privately through this repository's Security tab, not as a public issue. See SECURITY.md.
+  - name: aria2 problem
+    url: https://github.com/aria2/aria2/issues
+    about: If the failure is in the transfer itself and reproduces with aria2c on its own, it belongs upstream.

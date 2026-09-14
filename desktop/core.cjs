@@ -1,10 +1,62 @@
 const path = require('node:path');
 const fs = require('node:fs');
 const os = require('node:os');
+const https = require('node:https');
+
+const HF_ORIGIN = 'https://huggingface.co';
+const MAX_RESPONSE_BYTES = 64 * 1024 * 1024;
+
+function headerValue(headers, name) {
+  const value = headers[String(name).toLowerCase()];
+  return Array.isArray(value) ? value.join(', ') : value == null ? null : String(value);
+}
+
+// Electron's global fetch does not expose a way to require IPv4. The desktop
+// app uses this small HTTPS adapter for Hugging Face metadata instead.
+function fetchIPv4(input, options = {}) {
+  return new Promise((resolve, reject) => {
+    const url = input instanceof URL ? input : new URL(input);
+    if (url.protocol !== 'https:' || url.username || url.password) return reject(new Error('Only credential-free HTTPS URLs are allowed.'));
+    const request = https.request(url, {
+      method: options.method || 'GET', headers: options.headers, family: 4,
+      timeout: 30000, rejectUnauthorized: true
+    }, response => {
+      const chunks = []; let bytes = 0;
+      response.on('data', chunk => {
+        bytes += chunk.length;
+        if (bytes > MAX_RESPONSE_BYTES) request.destroy(new Error('Hugging Face returned an unexpectedly large response.'));
+        else chunks.push(chunk);
+      });
+      response.on('end', () => {
+        const body = Buffer.concat(chunks).toString('utf8');
+        resolve({
+          status: response.statusCode || 0,
+          ok: (response.statusCode || 0) >= 200 && (response.statusCode || 0) < 300,
+          headers: { get: name => headerValue(response.headers, name) },
+          json: async () => JSON.parse(body),
+          text: async () => body
+        });
+      });
+    });
+    request.on('timeout', () => request.destroy(new Error('Hugging Face request timed out.')));
+    request.on('error', reject);
+    if (options.signal) {
+      if (options.signal.aborted) request.destroy(options.signal.reason);
+      else options.signal.addEventListener('abort', () => request.destroy(options.signal.reason), { once: true });
+    }
+    request.end();
+  });
+}
+
+function validToken(value) {
+  const token = String(value || '').trim();
+  if (/[\x00-\x1f\x7f]/.test(token) || token.length > 4096) throw new Error('The Hugging Face token contains invalid characters.');
+  return token;
+}
 
 function safePath(value) {
   if (typeof value !== 'string' || !value || path.win32.isAbsolute(value) || /[\\:<>"|?*\x00-\x1f]/.test(value) ||
-    value.split('/').some(s => !s || s === '.' || s === '..' || /[. ]$/.test(s) || /^(CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])(?:\.|$)/i.test(s))) throw new Error('This repository contains a file path Windows cannot safely save.');
+    value.split('/').some(s => !s || s.length > 255 || s === '.' || s === '..' || /[. ]$/.test(s) || /^(CON|PRN|AUX|NUL|CONIN\$|CONOUT\$|COM(?:[1-9]|[\u00b9\u00b2\u00b3])|LPT(?:[1-9]|[\u00b9\u00b2\u00b3]))(?:\.|$)/i.test(s))) throw new Error('This repository contains a file path Windows cannot safely save.');
   return value;
 }
 function parseLink(input) {
@@ -34,7 +86,8 @@ function parseLink(input) {
 const encodePath = p => p.split('/').map(encodeURIComponent).join('/');
 function downloadUrl(info, file) {
   safePath(file);
-  return `https://huggingface.co/${info.kind === 'models' ? '' : info.kind + '/'}${info.repo}/resolve/${encodeURIComponent(info.rev)}/${encodePath(file)}?download=true`;
+  const revision = info.commit || info.rev;
+  return `${HF_ORIGIN}/${info.kind === 'models' ? '' : info.kind + '/'}${info.repo}/resolve/${encodePath(revision)}/${encodePath(file)}?download=true`;
 }
 function quantName(p) {
   const re = /(?:^|[^a-z0-9])((?:UD-)?(?:IQ[1-8](?:_[A-Z0-9]+)*|Q[1-8](?:_[A-Z0-9]+)*|TQ[12]_0|MXFP4|NVFP4|BF16|FP16|F16|F32))(?![a-z0-9])/i;
@@ -59,45 +112,119 @@ function bundles(files) {
   }).sort((a, b) => a.name.localeCompare(b.name));
 }
 function catalog(info, files) {
-  const scoped = files.filter(f => !info.subpath || (info.isFile ? f.path === info.subpath : f.path.startsWith(info.subpath + '/')));
+  let scoped = files.filter(f => !info.subpath || (info.isFile ? f.path === info.subpath : f.path.startsWith(info.subpath + '/')));
+  if (info.isFile && /-\d{5}-of-\d{5}\.gguf$/i.test(info.subpath)) {
+    const key = info.subpath.replace(/-\d{5}-of-\d{5}(?=\.gguf$)/i, '');
+    scoped = files.filter(f => f.path.replace(/-\d{5}-of-\d{5}(?=\.gguf$)/i, '') === key);
+  }
   return { info, files: scoped, bundles: bundles(scoped.filter(f => /\.gguf$/i.test(f.path) && !companionKind(f.path))), vision: bundles(files.filter(f => companionKind(f.path) === 'vision')), mtp: bundles(files.filter(f => companionKind(f.path) === 'mtp')) };
 }
-async function listRepo(input, token = '', fetcher = fetch) {
+const isSafePath = p => { try { safePath(p); return true; } catch { return false; } };
+function windowsPathKey(value) { return value.normalize('NFC').toLocaleLowerCase('en-US'); }
+function withoutWindowsCollisions(candidates) {
+  const exact = new Map();
+  for (const file of candidates) if (!exact.has(file.path)) exact.set(file.path, file);
+  const groups = new Map();
+  for (const file of exact.values()) {
+    const key = windowsPathKey(file.path);
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key).push(file);
+  }
+  const files = []; let skipped = 0;
+  for (const group of groups.values()) {
+    if (group.length > 1) skipped += group.length;
+    else files.push(group[0]);
+  }
+  const fileKeys = new Set(files.map(f => windowsPathKey(f.path)));
+  const unsafeParents = new Set();
+  for (const file of files) {
+    const parts = file.path.split('/');
+    for (let i = 1; i < parts.length; i++) if (fileKeys.has(windowsPathKey(parts.slice(0, i).join('/')))) unsafeParents.add(windowsPathKey(file.path));
+  }
+  return { files: files.filter(f => !unsafeParents.has(windowsPathKey(f.path))), skipped: skipped + unsafeParents.size };
+}
+async function listRepo(input, token = '', fetcher = fetchIPv4) {
   const info = parseLink(input);
-  let next = `https://huggingface.co/api/${info.kind}/${info.repo}/tree/${encodeURIComponent(info.rev)}?recursive=true&expand=false`;
-  const files = []; let pages = 0;
+  token = validToken(token);
+  let next = `${HF_ORIGIN}/api/${info.kind}/${info.repo}/tree/${encodePath(info.rev)}?recursive=true&expand=false`;
+  const candidates = []; let pages = 0, skipped = 0, commit = '';
   while (next) {
     if (++pages > 100) throw new Error('This repository is too large to list completely. Use a smaller repository.');
     const url = new URL(next);
-    if (url.origin !== 'https://huggingface.co') throw new Error('Unexpected file-list destination.');
+    if (url.origin !== HF_ORIGIN || url.username || url.password) throw new Error('Unexpected file-list destination.');
     const requestOptions = { headers: { 'User-Agent': 'HuggingFaceDownloader/0.2', ...(token ? { Authorization: `Bearer ${token}` } : {}) }, signal: AbortSignal.timeout(30000), redirect: 'manual' };
     let response;
     let requestUrl = url;
     for (let redirectCount = 0; ; redirectCount++) {
       const parsedRequestUrl = new URL(requestUrl);
-      if (parsedRequestUrl.origin !== 'https://huggingface.co') throw new Error('Unexpected file-list destination.');
+      if (parsedRequestUrl.origin !== HF_ORIGIN || parsedRequestUrl.username || parsedRequestUrl.password) throw new Error('Unexpected file-list destination.');
       response = await fetcher(parsedRequestUrl, requestOptions);
       if (![301, 302, 303, 307, 308].includes(response.status)) break;
       if (redirectCount >= 5) throw new Error('Hugging Face redirected the file listing too many times.');
       const location = response.headers.get('location');
       if (!location) throw new Error('Hugging Face returned an incomplete redirect.');
       const nextUrl = new URL(location, parsedRequestUrl);
-      if (nextUrl.origin !== 'https://huggingface.co') throw new Error('Unexpected file-list destination.');
+      if (nextUrl.origin !== HF_ORIGIN || nextUrl.username || nextUrl.password) throw new Error('Unexpected file-list destination.');
       requestUrl = nextUrl.toString();
     }
     if (!response.ok) throw new Error(response.status === 401 || response.status === 403 ? 'Access denied. Add a read token in Settings and accept any model access terms on Hugging Face.' : response.status === 404 ? 'Repository or branch not found. Check the link.' : `Hugging Face returned HTTP ${response.status}. Try again shortly.`);
+    const pageCommit = String(response.headers.get('x-repo-commit') || '').toLowerCase();
+    if (pageCommit) {
+      if (!/^[a-f0-9]{40,64}$/.test(pageCommit)) throw new Error('Hugging Face returned an invalid repository revision.');
+      if (commit && commit !== pageCommit) throw new Error('The repository changed while it was being listed. Reload it and try again.');
+      commit = pageCommit;
+    }
     const page = await response.json();
     if (!Array.isArray(page)) throw new Error('Unexpected repository listing.');
-    for (const f of page) if (f.type === 'file') { safePath(f.path); files.push({ path: f.path, size: Number(f.size) || 0 }); }
+    // One file Windows cannot name must not make the whole repository
+    // unloadable: skip it and let the user download everything else. The
+    // download path re-checks every selected file, so nothing unsafe slips by.
+    for (const f of page) if (f.type === 'file') {
+      const digest = String(f.lfs?.sha256 || f.lfs?.oid || '').replace(/^sha256:/i, '');
+      if (isSafePath(f.path)) candidates.push({ path: f.path, size: Number(f.size) || 0, sha256: /^[a-f0-9]{64}$/i.test(digest) ? digest.toLowerCase() : '' });
+      else skipped++;
+    }
     next = response.headers.get('link')?.match(/<([^>]+)>;\s*rel="next"/)?.[1] || '';
   }
-  if (!files.length) throw new Error('No files found in this repository.');
-  return { ...catalog(info, files), allFiles: files };
+  const collisionCheck = withoutWindowsCollisions(candidates);
+  skipped += collisionCheck.skipped;
+  const files = collisionCheck.files;
+  if (!files.length) throw new Error(skipped ? `None of the ${skipped} file(s) in this repository can be saved safely on Windows.` : 'No files found in this repository.');
+  if (commit) info.commit = commit;
+  return { ...catalog(info, files), allFiles: files, skipped };
+}
+async function resolveDownload(info, file, token = '', fetcher = fetchIPv4) {
+  token = validToken(token);
+  let current = new URL(downloadUrl(info, file));
+  for (let redirects = 0; redirects <= 10; redirects++) {
+    if (current.protocol !== 'https:' || current.username || current.password) throw new Error('Hugging Face returned an unsafe download address.');
+    // Once Hugging Face supplies a signed CDN URL, stop resolving. aria2 can
+    // follow later redirects without ever receiving the bearer token.
+    if (current.origin !== HF_ORIGIN) return { url: current.toString(), headers: [], maxRedirect: 10 };
+    const response = await fetcher(current, {
+      method: 'HEAD', redirect: 'manual',
+      headers: { 'User-Agent': 'HuggingFaceDownloader/0.3', ...(token ? { Authorization: `Bearer ${token}` } : {}) },
+      signal: AbortSignal.timeout(30000)
+    });
+    if ([301, 302, 303, 307, 308].includes(response.status)) {
+      if (redirects === 10) throw new Error('Hugging Face redirected the download too many times.');
+      const location = response.headers.get('location');
+      if (!location) throw new Error('Hugging Face returned an incomplete download redirect.');
+      current = new URL(location, current);
+      continue;
+    }
+    if (!response.ok) throw new Error(response.status === 401 || response.status === 403 ? 'Access denied. Check your Hugging Face token and model access.' : response.status === 404 ? 'File or revision not found. Reload the repository listing.' : `Hugging Face returned HTTP ${response.status} while preparing the download.`);
+    // Small private files can be served directly by huggingface.co. In that
+    // case aria2 gets the header, but redirects are disabled so it cannot be
+    // forwarded to another host.
+    return { url: current.toString(), headers: token ? [`Authorization: Bearer ${token}`] : [], maxRedirect: 0 };
+  }
+  throw new Error('Hugging Face redirected the download too many times.');
 }
 function readToken(env = process.env) {
-  for (const key of ['HF_TOKEN','HUGGING_FACE_HUB_TOKEN','HUGGINGFACE_TOKEN']) if (env[key]?.trim()) return env[key].trim();
+  for (const key of ['HF_TOKEN','HUGGING_FACE_HUB_TOKEN','HUGGINGFACE_TOKEN']) if (env[key]?.trim()) return validToken(env[key]);
   const filename = env.HF_TOKEN_PATH || path.join(env.HF_HOME || path.join(env.XDG_CACHE_HOME || path.join(os.homedir(), '.cache'), 'huggingface'), 'token');
-  try { return fs.readFileSync(filename, 'utf8').trim(); } catch { return ''; }
+  try { return validToken(fs.readFileSync(filename, 'utf8')); } catch (error) { if (error?.code === 'ENOENT') return ''; throw error; }
 }
 function findAria(explicit, root) {
   if (explicit) { if (fs.existsSync(explicit) && fs.statSync(explicit).isFile() && /\.exe$/i.test(explicit)) return path.resolve(explicit); throw new Error('The selected aria2 executable was not found. Choose aria2c.exe in Settings.'); }
@@ -111,4 +238,4 @@ function findAria(explicit, root) {
   }
   return candidates.find(p => fs.existsSync(p) && fs.statSync(p).isFile()) || '';
 }
-module.exports = { safePath, parseLink, downloadUrl, quantName, bits, companionKind, bundles, catalog, listRepo, readToken, findAria };
+module.exports = { safePath, isSafePath, parseLink, downloadUrl, resolveDownload, quantName, bits, companionKind, bundles, catalog, listRepo, readToken, findAria, validToken, fetchIPv4, withoutWindowsCollisions };

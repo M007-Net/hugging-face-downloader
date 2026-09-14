@@ -1,15 +1,60 @@
 name: Tests
 on: [push, pull_request, workflow_dispatch]
+
+# Read-only by default. No job here needs to write to the repository, and a
+# workflow that cannot write cannot be turned into one that does by a dependency.
 permissions:
   contents: read
+
+defaults:
+  run:
+    shell: pwsh
+
 jobs:
-  windows:
+  terminal:
+    name: Terminal (${{ matrix.shell }})
     runs-on: windows-latest
+    timeout-minutes: 15
     strategy:
+      fail-fast: false
       matrix:
         shell: [powershell, pwsh]
     steps:
-      - uses: actions/checkout@v4
+      # Actions are pinned to commit SHAs rather than tags: a tag can be moved
+      # to point at different code. Dependabot keeps these current.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
       - name: Run offline tests
         shell: ${{ matrix.shell }}
         run: ./tests/run-tests.ps1
+
+  desktop:
+    name: Desktop (core + UI)
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 20
+          cache: npm
+      # ELECTRON_SKIP_BINARY_DOWNLOAD keeps CI off the ~100MB Electron binary:
+      # these suites exercise core.cjs and the static UI, neither of which
+      # launches a window.
+      - name: Install dependencies
+        run: npm ci
+        env:
+          ELECTRON_SKIP_BINARY_DOWNLOAD: '1'
+      - name: Core unit tests
+        run: npm test
+      - name: UI smoke test
+        run: npm run qa
+      # The lockfile is what `npm ci` installs from, so a pull request that edits
+      # package.json without regenerating it would install something other than
+      # what it claims.
+      - name: Lockfile is in sync
+        run: |
+          git diff --exit-code -- package-lock.json

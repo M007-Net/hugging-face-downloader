@@ -4,6 +4,8 @@ const path = require('node:path');
 const os = require('node:os');
 const { pathToFileURL } = require('node:url');
 const core = require('./core.cjs');
+const updater = require('./updater.cjs');
+const manifest = require('../package.json');
 const { Transfer } = require('./transfer.cjs');
 const testing = !app.isPackaged && process.env.HFD_QA === '1';
 if (testing) {
@@ -14,17 +16,41 @@ if (testing) {
   app.setPath('userData', path.join(os.tmpdir(), `hfd-qa-${process.pid}`));
   app.disableHardwareAcceleration();
 }
-if (!app.requestSingleInstanceLock()) app.quit();
+// app.quit() is asynchronous, so without this guard the rest of the module keeps
+// running in the losing instance and can still put a second window on screen.
+const primaryInstance = app.requestSingleInstanceLock();
+if (!primaryInstance) app.quit();
 let window, currentCatalog, sessionToken = '', settings, settingsFile, lastJobFile;
+// null until a check has run. `downloaded` holds the verified installer path, so
+// installing is a second, separate click rather than something a check can cause.
+let update = { state: 'idle', configured: !!updater.parseRepository(manifest.repository), error: '', result: null, downloaded: '', received: 0 };
 const engine = new Transfer();
 const root = app.isPackaged ? process.resourcesPath : path.resolve(__dirname, '..');
 const defaults = { outputDir: path.join(os.homedir(),'Downloads','HuggingFace'), quant:'', connections:16, disableIPv6:true, aria2Path:'' };
 function readJSON(file, fallback) { try { return JSON.parse(fs.readFileSync(file,'utf8').replace(/^\uFEFF/,'')); } catch { return fallback; } }
 function saveJSON(file, value) { fs.mkdirSync(path.dirname(file), { recursive:true }); fs.writeFileSync(file + '.tmp', JSON.stringify(value,null,2)); fs.renameSync(file + '.tmp',file); }
+function cleanSettings(value = {}) {
+  const outputDir = typeof value.outputDir === 'string' && path.isAbsolute(value.outputDir) ? value.outputDir : defaults.outputDir;
+  const connections = Number.isInteger(Number(value.connections)) && Number(value.connections) >= 1 && Number(value.connections) <= 16 ? Number(value.connections) : defaults.connections;
+  return { outputDir, quant:typeof value.quant === 'string' ? value.quant.slice(0,128) : '', connections, disableIPv6:true, aria2Path:typeof value.aria2Path === 'string' ? value.aria2Path : '' };
+}
+function availableToken() { return core.validToken(sessionToken || core.readToken()); }
 function status() {
-  let aria = ''; let ariaError = '';
+  let aria = ''; let ariaError = ''; let tokenAvailable = false; let tokenError = '';
   try { aria = core.findAria(settings.aria2Path, root); } catch (e) { ariaError = e.message; }
-  return { settings, aria, ariaError, tokenAvailable: !!(sessionToken || core.readToken()), job: engine.job, version:app.getVersion() };
+  try { tokenAvailable = !!availableToken(); } catch (e) { tokenError = e.message; }
+  return { settings, aria, ariaError, tokenAvailable, tokenError, job: engine.job, version:app.getVersion(), update };
+}
+function publishUpdate() { if (window && !window.isDestroyed()) window.webContents.send('update-state', update); }
+async function runUpdateCheck() {
+  if (!update.configured || update.state === 'checking' || update.state === 'downloading') return update;
+  update = { ...update, state:'checking', error:'' }; publishUpdate();
+  try {
+    const result = await updater.checkForUpdate({ repository:manifest.repository, currentVersion:app.getVersion() });
+    update = { ...update, state:'idle', result, error:'' };
+  } catch (error) { update = { ...update, state:'idle', error:error.message }; }
+  publishUpdate();
+  return update;
 }
 function handle(name, fn) {
   ipcMain.handle(name, async (event, ...args) => {
@@ -32,16 +58,20 @@ function handle(name, fn) {
     return fn(...args);
   });
 }
-app.whenReady().then(() => {
+if (primaryInstance) app.whenReady().then(() => {
   settingsFile = path.join(app.getPath('userData'),'settings.json'); lastJobFile = path.join(app.getPath('userData'),'last-download.json');
-  settings = { ...defaults, ...readJSON(settingsFile,{}) };
-  settings.disableIPv6 = true;
+  settings = cleanSettings(readJSON(settingsFile,{}));
   if (!fs.existsSync(settingsFile) && !testing) {
     const terminalSettings = readJSON(path.join(process.env.LOCALAPPDATA || os.homedir(),'HuggingFaceDownloader','settings.json'),{});
     settings.outputDir = terminalSettings.outputDir || defaults.outputDir; settings.quant = terminalSettings.quant || '';
   }
-  engine.job = readJSON(lastJobFile,null);
-  if (engine.job && engine.job.status !== 'complete') { engine.job.status = 'paused'; engine.job.files.forEach(f => { if (f.status !== 'complete') f.status = 'waiting'; }); }
+  // readJSON only guards against unparseable files. A job saved by a different
+  // version can parse fine and still be the wrong shape, and anything thrown
+  // here aborts the rest of this callback, leaving the app with no window at
+  // all, so require the shape before trusting it.
+  const saved = readJSON(lastJobFile,null);
+  engine.job = saved && Array.isArray(saved.files) && typeof saved.destination === 'string' && saved.info ? saved : null;
+  if (engine.job && engine.job.status !== 'complete') { engine.job.status = 'paused'; engine.job.files.forEach(f => { if (f && f.status !== 'complete') f.status = 'waiting'; }); }
   const uiFile = path.join(__dirname,'index.html');
   window = new BrowserWindow({ width:1360, height:950, minWidth:1000, minHeight:720, backgroundColor:'#101416', title:'Hugging Face Downloader', autoHideMenuBar:true, show:false,
     webPreferences:{ preload:path.join(__dirname,'preload.cjs'), contextIsolation:true, nodeIntegration:false, sandbox:true } });
@@ -67,7 +97,7 @@ app.whenReady().then(() => {
     if (engine.busy) throw new Error('Pause the current download before loading another repository.');
     currentCatalog = null;
     if (testing) { const info = core.parseLink(link); const files = readJSON(path.join(root,'tests','repository-fixture.json'),[]).filter(f => f.type === 'file'); currentCatalog = { ...core.catalog(info,files), allFiles:files }; }
-    else currentCatalog = await core.listRepo(link, sessionToken || core.readToken());
+    else currentCatalog = await core.listRepo(link, availableToken());
     const { allFiles, ...visible } = currentCatalog; return visible;
   });
   handle('choose-folder', async () => { const result = await dialog.showOpenDialog(window,{ properties:['openDirectory','createDirectory'], defaultPath:settings.outputDir }); return result.canceled ? '' : result.filePaths[0]; });
@@ -75,11 +105,11 @@ app.whenReady().then(() => {
   handle('lm-folder', () => path.join(os.homedir(),'.lmstudio','models'));
   handle('save-settings', value => {
     if (engine.busy) throw new Error('Pause the download before changing settings.');
-    const next = { outputDir:String(value.outputDir || settings.outputDir), quant:String(value.quant ?? settings.quant), connections:Number(value.connections ?? settings.connections), disableIPv6:true, aria2Path:String(value.aria2Path ?? settings.aria2Path) };
+    const next = { outputDir:String(value.outputDir || settings.outputDir), quant:String(value.quant ?? settings.quant).slice(0,128), connections:Number(value.connections ?? settings.connections), disableIPv6:true, aria2Path:String(value.aria2Path ?? settings.aria2Path) };
     if (!path.isAbsolute(next.outputDir)) throw new Error('Choose an absolute download folder.');
     if (!Number.isInteger(next.connections) || next.connections < 1 || next.connections > 16) throw new Error('Connections must be between 1 and 16.');
     if (next.aria2Path) core.findAria(next.aria2Path,root);
-    if (typeof value.token === 'string') { if (/[\r\n]/.test(value.token)) throw new Error('Invalid token.'); sessionToken = value.token.trim(); }
+    if (typeof value.token === 'string') sessionToken = core.validToken(value.token);
     settings = next; saveJSON(settingsFile, settings); return status();
   });
   handle('start-download', selection => {
@@ -90,18 +120,78 @@ app.whenReady().then(() => {
     const executable = core.findAria(settings.aria2Path,root); if (!executable) throw new Error('aria2 is not installed. Open Settings to choose it or view setup instructions.');
     const info = currentCatalog.info;
     const destination = path.join(settings.outputDir, ...(info.kind === 'models' ? [] : [info.kind]), ...info.repo.split('/'));
-    return engine.start({ info, files, destination }, executable,settings,sessionToken || core.readToken());
+    return engine.start({ info, files, destination }, executable,settings,availableToken());
   });
   handle('pause-download', () => engine.pause());
   handle('resume-download', () => {
     if (testing) throw new Error('Downloads are disabled in UI tests.');
     if (!engine.job) throw new Error('No download to resume.');
     const executable = core.findAria(settings.aria2Path,root); if (!executable) throw new Error('Choose aria2 in Settings first.');
-    return engine.start(engine.job,executable,settings,sessionToken || core.readToken());
+    return engine.start(engine.job,executable,settings,availableToken());
   });
   handle('open-folder', async () => { const folder = engine.job?.destination || settings.outputDir; fs.mkdirSync(folder,{recursive:true}); const error = await shell.openPath(folder); if (error) throw new Error(error); });
   handle('open-terminal', async () => { const file = path.join(app.isPackaged ? path.join(root,'terminal') : root,'HF Download.cmd'); const error = await shell.openPath(file); if (error) throw new Error(error); });
   handle('aria-help', () => shell.openExternal('https://github.com/aria2/aria2/releases'));
+  handle('check-update', () => runUpdateCheck());
+  handle('download-update', async () => {
+    const asset = update.result?.asset;
+    if (!asset) throw new Error('There is no verifiable installer to download for this release.');
+    if (update.state === 'downloading') throw new Error('The update is already downloading.');
+    update = { ...update, state:'downloading', error:'', received:0, downloaded:'' }; publishUpdate();
+    try {
+      const folder = path.join(app.getPath('userData'), 'updates');
+      // Installers are ~90MB each. Keep only the one being fetched rather than
+      // growing a pile of them in the user's profile.
+      try { fs.rmSync(folder, { recursive: true, force: true }); } catch { /* in use; the download still works */ }
+      // The asset name comes from GitHub, so it never becomes part of a path.
+      const target = path.join(folder, `Hugging-Face-Downloader-Setup-${update.result.version}.exe`);
+      let lastSent = 0;
+      const saved = await updater.downloadAsset(asset, target, { onProgress: received => {
+        if (Date.now() - lastSent < 250) return;
+        lastSent = Date.now(); update = { ...update, received }; publishUpdate();
+      } });
+      update = { ...update, state:'ready', received:saved.size, downloaded:saved.path };
+    } catch (error) { update = { ...update, state:'idle', received:0, downloaded:'', error:error.message }; publishUpdate(); throw error; }
+    publishUpdate();
+    return update;
+  });
+  handle('install-update', async () => {
+    if (!update.downloaded) throw new Error('Download the update first.');
+    if (engine.busy) throw new Error('Pause the current download before installing an update.');
+    const choice = await dialog.showMessageBox(window, {
+      type:'warning', message:'Install this update now?',
+      detail:`The installer was verified against the SHA-256 published with release ${update.result?.version}. It is not code-signed, so Windows SmartScreen will still warn about it. This app will close so the installer can replace it.`,
+      buttons:['Cancel','Run the installer'], defaultId:0, cancelId:0
+    });
+    if (choice.response !== 1) return update;
+    const error = await shell.openPath(update.downloaded);
+    if (error) throw new Error(error);
+    // The dialog above says this app closes, and NSIS cannot replace files that
+    // are still open, so actually close. The delay lets the installer get far
+    // enough to show its own window first.
+    setTimeout(() => app.quit(), 1500);
+    return update;
+  });
+  handle('open-release', async () => {
+    const target = update.result?.releaseUrl;
+    if (!target) throw new Error('No release page is known yet.');
+    const parsed = new URL(target);
+    if (parsed.protocol !== 'https:' || parsed.hostname !== 'github.com') throw new Error('Refusing to open an unexpected release address.');
+    return shell.openExternal(parsed.toString());
+  });
+  handle('reveal-update', () => { if (update.downloaded) shell.showItemInFolder(update.downloaded); });
+  // A failed startup check must never be fatal: it is reported in the UI
+  // through `update.error` and the user can retry from Settings.
+  if (update.configured && !testing) setTimeout(() => { runUpdateCheck().catch(() => {}); }, 2500);
+}).catch(error => {
+  // Without this the app would sit running with no window and no explanation.
+  dialog.showErrorBox('Hugging Face Downloader could not start', String(error && error.stack || error));
+  app.exit(1);
 });
 app.on('second-instance', () => { if (window) { if (window.isMinimized()) window.restore(); window.focus(); } });
+// Only the window-close dialog pauses the engine. Every other exit path - the
+// last window closing, a session logout, Alt+F4 while idle - would otherwise
+// leave the current aria2c child running in the background with a half-written
+// .part file and no one watching it.
+app.on('before-quit', () => { if (engine.child) { try { engine.child.kill(); } catch { /* already gone */ } } });
 app.on('window-all-closed', () => app.quit());

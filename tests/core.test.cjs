@@ -61,7 +61,53 @@ test('follows same-site API redirects but never sends tokens off Hugging Face',a
   const c=await core.listRepo('owner/repo','secret',fetcher); assert.equal(c.files.length,1); assert.equal(calls,2); assert.deepEqual(seen.map(x=>x.redirect),['manual','manual']); assert.ok(seen.every(x=>x.auth==='Bearer secret'));
   await assert.rejects(core.listRepo('owner/repo','secret',async(_url,options)=>({status:302,ok:false,headers:new Headers({location:'https://evil.example/steal'})})),/Unexpected/);
 });
+test('a file Windows cannot name is skipped, not fatal to the whole listing',async()=>{
+  const page=[
+    {type:'file',path:'model-Q4_K_M.gguf',size:100},
+    {type:'file',path:'weird:name.bin',size:10},      // colon
+    {type:'file',path:'trailing.',size:10},           // trailing dot
+    {type:'file',path:'sub/CON.gguf',size:10},        // reserved device name
+    {type:'file',path:'mmproj-F16.gguf',size:20}
+  ];
+  const c=await core.listRepo('owner/repo','',async()=>({ok:true,status:200,headers:new Headers(),json:async()=>page}));
+  assert.equal(c.skipped,3);
+  assert.deepEqual(c.allFiles.map(f=>f.path),['model-Q4_K_M.gguf','mmproj-F16.gguf']);
+  assert.ok(c.bundles.some(b=>b.quant==='Q4_K_M'));
+  assert.equal(c.vision.length,1);
+  // Everything that survives must still pass the download-time check.
+  for(const f of c.allFiles) assert.doesNotThrow(()=>core.safePath(f.path));
+});
+test('a repository of only unsafe names fails with a specific message',async()=>{
+  await assert.rejects(
+    core.listRepo('owner/repo','',async()=>({ok:true,status:200,headers:new Headers(),json:async()=>[{type:'file',path:'a:b',size:1}]})),
+    /saved safely on Windows/);
+});
 test('access errors are actionable and download URLs escape filenames',async()=>{
   await assert.rejects(core.listRepo('owner/repo','',async()=>({ok:false,status:403})),/read token/);
   assert.equal(core.downloadUrl(core.parseLink('owner/repo'),'model name.gguf'),'https://huggingface.co/owner/repo/resolve/main/model%20name.gguf?download=true');
+});
+test('pins downloads to the repository commit and encodes slashed revisions by segment',async()=>{
+  const commit='a'.repeat(40);
+  const c=await core.listRepo('https://huggingface.co/owner/repo/tree/refs/pr/3','',async()=>({ok:true,status:200,headers:new Headers({'x-repo-commit':commit}),json:async()=>[{type:'file',path:'model name.gguf',size:10,lfs:{sha256:'b'.repeat(64)}}]}));
+  assert.equal(c.info.commit,commit);
+  assert.equal(c.files[0].sha256,'b'.repeat(64));
+  assert.equal(core.downloadUrl(c.info,c.files[0].path),`https://huggingface.co/owner/repo/resolve/${commit}/model%20name.gguf?download=true`);
+  assert.equal(core.downloadUrl(core.parseLink('https://huggingface.co/owner/repo/tree/refs/pr/3'),'model.gguf'),'https://huggingface.co/owner/repo/resolve/refs/pr/3/model.gguf?download=true');
+});
+test('rejects token controls and Windows case, normalization, and file-directory collisions',async()=>{
+  assert.throws(()=>core.validToken('safe\r\n  header=bad'),/invalid/);
+  const files=[{path:'A.gguf'},{path:'a.gguf'},{path:'folder'},{path:'folder/model.gguf'},{path:'café.gguf'},{path:'café.gguf'},{path:'ok.gguf'}];
+  assert.deepEqual(core.withoutWindowsCollisions(files).files.map(f=>f.path),['folder','ok.gguf']);
+});
+test('resolves authenticated redirects without forwarding the token to a CDN',async()=>{
+  const seen=[];
+  const prepared=await core.resolveDownload(core.parseLink('owner/repo'),'model.gguf','secret',async(url,options)=>{
+    seen.push({url:String(url),auth:options.headers.Authorization,redirect:options.redirect});
+    return {status:302,ok:false,headers:new Headers({location:'https://cdn.example/signed'})};
+  });
+  assert.equal(prepared.url,'https://cdn.example/signed');
+  assert.deepEqual(prepared.headers,[]);
+  assert.equal(prepared.maxRedirect,10);
+  assert.equal(seen[0].auth,'Bearer secret');
+  assert.equal(seen[0].redirect,'manual');
 });

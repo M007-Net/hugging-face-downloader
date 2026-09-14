@@ -1,0 +1,69 @@
+name: Bug report
+description: Something did not work the way it should have
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Before you start: if this has a security angle, please use the Security
+        tab instead of a public issue. See SECURITY.md.
+
+        **Do not paste a Hugging Face token anywhere in this form.**
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What you did, and what the tool did instead of what you expected.
+      placeholder: |
+        I pasted a link to ... and picked the Q4_K_M quantization.
+        The download reached 80% and then reported "..." .
+    validations:
+      required: true
+
+  - type: dropdown
+    id: surface
+    attributes:
+      label: Which one were you using?
+      options:
+        - Desktop app
+        - PowerShell script (hf-download.ps1)
+        - Both
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: From the desktop app's title bar, or the installer filename.
+      placeholder: "0.3.0"
+    validations:
+      required: true
+
+  - type: input
+    id: repo-link
+    attributes:
+      label: Repository link
+      description: The Hugging Face link you used, if the problem depends on it. Leave blank for a private or gated repository.
+      placeholder: https://huggingface.co/owner/repository
+
+  - type: textarea
+    id: output
+    attributes:
+      label: Error text or console output
+      description: Paste the message as it appeared. Check it for tokens and local paths before submitting.
+      render: text
+
+  - type: input
+    id: windows
+    attributes:
+      label: Windows version
+      placeholder: "Windows 11 24H2"
+
+  - type: input
+    id: aria2
+    attributes:
+      label: aria2 version
+      description: Output of `aria2c --version` (first line only).
+      placeholder: "aria2 version 1.37.0"

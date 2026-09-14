@@ -1,0 +1,28 @@
+name: Feature request
+description: Suggest something the tool should do
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: What are you trying to do?
+      description: Describe the situation rather than the solution. It often turns out there is a simpler fix than the one we would have guessed at.
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: What would you like it to do instead?
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: What are you doing today to work around it?
+
+  - type: checkboxes
+    id: scope
+    attributes:
+      label: Scope check
+      options:
+        - label: This is about downloading from Hugging Face, not about running or converting models.

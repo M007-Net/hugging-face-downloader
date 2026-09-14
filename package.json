@@ -1,9 +1,14 @@
 {
   "name": "hugging-face-downloader",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "A guided desktop and terminal downloader for Hugging Face models",
   "author": "Hugging Face Downloader contributors",
+  "keywords": ["hugging-face", "gguf", "aria2", "lm-studio", "windows"],
+  "license": "MIT",
+  "engines": { "node": ">=20" },
   "private": true,
+  "//repository": "EDIT THIS: replace YOUR_GITHUB_USERNAME with your GitHub account. Until you do, the in-app updater stays switched off instead of calling out to the network. See README.md, 'Turning on the updater'.",
+  "repository": { "type": "git", "url": "https://github.com/YOUR_GITHUB_USERNAME/hugging-face-downloader" },
   "main": "desktop/main.cjs",
   "scripts": {
     "start": "electron .",
