@@ -1,8 +1,18 @@
 # Hugging Face Downloader
 
-A Windows downloader for Hugging Face models, powered by aria2. Pick a GGUF
-quantization by bit level and exact variant, or choose individual files. Comes
-as a guided desktop app and as a terminal script that share the same rules.
+Downloads AI models from Hugging Face onto your Windows PC, quickly and without
+you having to work out which of the forty files in a folder you actually need.
+
+**In plain words:** Hugging Face is a website where AI models are published. One
+model is usually offered in several sizes — smaller ones are faster and use less
+memory, larger ones tend to answer better. Those sizes have names like `Q4_K_M`
+and `IQ3_XXS`, which mean nothing until someone explains them. This app lists what
+is available, tells you what each option costs in disk space, and downloads only
+the pieces that belong together. Large models are often split across several files;
+it keeps those together for you.
+
+It comes as a point-and-click app and, for anyone who prefers typing, a terminal
+script that follows exactly the same rules.
 
 > **This is an unofficial community project.** It is not affiliated with,
 > endorsed by, or supported by Hugging Face. It talks to the public Hugging Face
@@ -135,6 +145,10 @@ There are two ways. **Option A is the easy one.**
    there may be no release published yet — in either case use Option B and build
    it yourself.
 2. Download `Hugging-Face-Downloader-Setup-<version>.exe`.
+
+   > If that page is empty or you cannot open it, no release has been published
+   > yet. Until one is, use **Option B — Run from source** below, or wait for a
+   > release. Nothing is lost by waiting.
 3. **Before running it, check the hash.** The installer is not code-signed, so
    this is the only way to confirm you got the file the release actually
    published:
@@ -423,6 +437,9 @@ username or on which applications you have installed.
   download is refused rather than finished on trust.
 - A folder being written to is locked, so two copies of the app cannot fight
   over the same files.
+- The download engine and the destination folder must both be on a local drive.
+  A network location is refused, so neither can pull a program from, or write to,
+  another machine.
 
 ### Where your token goes
 

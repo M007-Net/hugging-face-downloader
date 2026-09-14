@@ -54,6 +54,11 @@ terminal script — are covered; where a fix applies to only one, it says so.
   profile cannot turn off certificate checking, redirect the output folder, or run a
   program after each file.
 - A repository name can no longer contain `.` or `..` path segments.
+- **The download engine could be pointed at a network location.** The Settings field
+  is free text and whatever it names is spawned; "exists and ends in .exe" accepted
+  `\\host\share\aria2c.exe`, so a pasted path could run a binary from another
+  machine, with Windows authenticating to that share on the way. It must now be an
+  absolute path on a local drive, matching how the destination folder is checked.
 
 ### Fixed
 

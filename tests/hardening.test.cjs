@@ -60,3 +60,26 @@ test('a repository name cannot contain dot segments', () => {
   assert.deepEqual(parseRepository('owner/repo'), { owner: 'owner', repo: 'repo' });
   assert.deepEqual(parseRepository('https://github.com/some.owner/some-repo.js'), { owner: 'some.owner', repo: 'some-repo.js' });
 });
+
+// Whatever the Settings field names is spawned. "Exists and ends in .exe" accepted a
+// UNC path, so a pasted value could run a binary from another machine — and Windows
+// would authenticate to that share on the way there.
+test('the download engine must be a local executable, not a network one', () => {
+  const { localExecutable, findAria } = require('../desktop/core.cjs');
+  const B = String.fromCharCode(92);
+
+  assert.equal(localExecutable(`C:${B}Tools${B}aria2${B}aria2c.exe`), true, 'an ordinary local path is fine');
+  assert.equal(localExecutable('D:/tools/aria2c.exe'), true, 'forward slashes are fine');
+  assert.equal(localExecutable(`C:${B}Program Files${B}aria2${B}aria2c.exe`), true, 'spaces are fine');
+
+  assert.equal(localExecutable(`${B}${B}attacker.example${B}share${B}aria2c.exe`), false, 'UNC is refused');
+  assert.equal(localExecutable('https://evil.example/aria2c.exe'), false, 'a URL is refused');
+  assert.equal(localExecutable(`tools${B}aria2c.exe`), false, 'a relative path is refused');
+  assert.equal(localExecutable(`C:${B}tools${B}..${B}..${B}aria2c.exe`), false, 'traversal is refused');
+  assert.equal(localExecutable(`C:${B}tools${B}aria2c.bat`), false, 'only .exe is accepted');
+  assert.equal(localExecutable(`C:${B}tools${B}a\u0001b.exe`), false, 'control characters are refused');
+  assert.equal(localExecutable(''), false);
+
+  // And the refusal happens before anything touches the filesystem or spawns.
+  assert.throws(() => findAria(`${B}${B}attacker.example${B}share${B}aria2c.exe`, '.'), /local drive/);
+});

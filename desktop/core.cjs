@@ -231,8 +231,24 @@ function readToken(env = process.env) {
   const filename = env.HF_TOKEN_PATH || path.join(env.HF_HOME || path.join(env.XDG_CACHE_HOME || path.join(os.homedir(), '.cache'), 'huggingface'), 'token');
   try { return validToken(fs.readFileSync(filename, 'utf8')); } catch (error) { if (error?.code === 'ENOENT') return ''; throw error; }
 }
+// The Settings field is free text, and whatever it names is spawned. Existing-and-ends-
+// in-.exe was not enough: it accepted "\\\\host\\share\\aria2c.exe", so a path typed or
+// pasted in could run a binary off someone else's machine, and Windows would authenticate
+// to that share on the way. A download engine is a program on a local drive.
+function localExecutable(value) {
+  if (typeof value !== 'string' || !value || value.length > 32767) return false;
+  if (/[\u0000-\u001f"<>|*?]/.test(value)) return false;
+  if (value.startsWith('\\\\') || /^[a-z][a-z0-9+.-]*:\/\//i.test(value)) return false;
+  if (!/^[A-Za-z]:[\\/]/.test(value)) return false;
+  if (value.split(/[\\/]/).includes('..')) return false;
+  return /\.exe$/i.test(value);
+}
 function findAria(explicit, root) {
-  if (explicit) { if (fs.existsSync(explicit) && fs.statSync(explicit).isFile() && /\.exe$/i.test(explicit)) return path.resolve(explicit); throw new Error('The selected aria2 executable was not found. Choose aria2c.exe in Settings.'); }
+  if (explicit) {
+    if (!localExecutable(explicit)) throw new Error('Choose aria2c.exe by its full path on a local drive, for example C:\\Tools\\aria2\\aria2c.exe. Network locations are not accepted.');
+    if (fs.existsSync(explicit) && fs.statSync(explicit).isFile()) return path.resolve(explicit);
+    throw new Error('The selected aria2 executable was not found. Choose aria2c.exe in Settings.');
+  }
   const candidates = [path.join(root, 'bin', 'aria2c.exe'), ...String(process.env.PATH || '').split(path.delimiter).filter(Boolean).map(p => path.join(p, 'aria2c.exe'))];
   for (const [key, rel] of [['LOCALAPPDATA','Microsoft/WinGet/Links/aria2c.exe'],['ProgramFiles','aria2/aria2c.exe'],['ProgramData','chocolatey/bin/aria2c.exe']]) if (process.env[key]) candidates.push(path.join(process.env[key], rel));
   candidates.push(path.join(os.homedir(),'scoop','shims','aria2c.exe'));
@@ -243,4 +259,4 @@ function findAria(explicit, root) {
   }
   return candidates.find(p => fs.existsSync(p) && fs.statSync(p).isFile()) || '';
 }
-module.exports = { safePath, isSafePath, parseLink, downloadUrl, resolveDownload, quantName, bits, companionKind, bundles, catalog, listRepo, readToken, findAria, validToken, fetchIPv4, withoutWindowsCollisions };
+module.exports = { localExecutable, safePath, isSafePath, parseLink, downloadUrl, resolveDownload, quantName, bits, companionKind, bundles, catalog, listRepo, readToken, findAria, validToken, fetchIPv4, withoutWindowsCollisions };
