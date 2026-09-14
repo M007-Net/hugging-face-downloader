@@ -125,6 +125,12 @@ terminal script — are covered; where a fix applies to only one, it says so.
 
 ### Changed
 
+- **CI never ran.** `test.yml` set `shell: ${{ matrix.shell }}`, but a `shell:` value
+  is validated before the matrix expands, so the workflow failed at startup on every
+  commit: no jobs, and it appeared in Actions under its file path instead of its name.
+  The interpreter is now chosen inside `run`, which does take expressions. The suite
+  still runs under both Windows PowerShell 5.1 and PowerShell 7.
+
 - The `repository` field now names `M007-Net/hugging-face-downloader`, so the
   in-app updater is armed rather than switched off. While the repository is
   private the check is answered with a 404 and fails silently — no banner, no

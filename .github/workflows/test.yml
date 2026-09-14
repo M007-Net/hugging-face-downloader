@@ -25,9 +25,14 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           persist-credentials: false
+      # The interpreter is chosen inside `run`, not with `shell:`. A `shell:` value is
+      # validated before the matrix is expanded, so `shell: ${{ matrix.shell }}` left an
+      # unresolved expression where a known shell name had to be: the whole workflow
+      # failed to start, produced no jobs at all, and showed up in Actions under its
+      # file path instead of its name. The point of the matrix - running the suite under
+      # both Windows PowerShell 5.1 and PowerShell 7 - is unchanged.
       - name: Run offline tests
-        shell: ${{ matrix.shell }}
-        run: ./tests/run-tests.ps1
+        run: ${{ matrix.shell }} -NoProfile -ExecutionPolicy Bypass -File ./tests/run-tests.ps1
 
   desktop:
     name: Desktop (core + UI)
