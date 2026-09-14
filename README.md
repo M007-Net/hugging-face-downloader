@@ -129,11 +129,11 @@ There are two ways. **Option A is the easy one.**
 
 #### Option A — Run the installer
 
-1. Go to the **Releases** page of wherever this project is published. There is no
-   canonical URL here yet: the `repository` field in `package.json` still holds the
-   `YOUR_GITHUB_USERNAME` placeholder, which is also what keeps the in-app updater
-   switched off. See **Turning on the updater** below. If you have no release to
-   download from, use Option B and build it yourself.
+1. Go to the project's **Releases** page:
+   <https://github.com/M007-Net/hugging-face-downloader/releases>. While the
+   repository is private that page is visible only to accounts with access, and
+   there may be no release published yet — in either case use Option B and build
+   it yourself.
 2. Download `Hugging-Face-Downloader-Setup-<version>.exe`.
 3. **Before running it, check the hash.** The installer is not code-signed, so
    this is the only way to confirm you got the file the release actually
@@ -157,7 +157,7 @@ There are two ways. **Option A is the easy one.**
 You need [Node.js](https://nodejs.org) 20 or newer (the LTS installer is fine).
 
 ```powershell
-git clone https://github.com/YOUR_GITHUB_USERNAME/hugging-face-downloader.git
+git clone https://github.com/M007-Net/hugging-face-downloader.git
 cd hugging-face-downloader
 npm ci
 ```
@@ -320,17 +320,24 @@ is the only real check available.
 
 ### Turning on the updater
 
-**The updater is switched off in a fresh clone** and will not contact the
-network until you point it at your repository. One line:
+`desktop/updater.cjs` reads one field, and nothing else decides whether update
+checks happen:
 
 ```jsonc
 // package.json
-"repository": { "type": "git", "url": "https://github.com/YOUR_GITHUB_USERNAME/hugging-face-downloader" }
+"repository": { "type": "git", "url": "https://github.com/M007-Net/hugging-face-downloader" }
 ```
 
-Replace `YOUR_GITHUB_USERNAME` with your GitHub account. That is the only edit —
-`desktop/updater.cjs` reads this field, and the literal placeholder is what keeps
-it disabled. **Settings → Updates** says which state the current build is in.
+Set to the literal owner `YOUR_GITHUB_USERNAME`, that field switches update
+checks off completely and the app makes no outbound request at all. A fork should
+either point it at its own repository or restore the placeholder.
+
+While this repository is private, the check asks `api.github.com` about once per
+launch and is answered with a 404, because an unauthenticated client cannot see a
+private repository. That failure is silent by design: no banner appears and
+nothing is downloaded. Checks start returning real results once the repository is
+public and has a published release. **Settings → Updates** says which state the
+current build is in.
 
 ### Publishing a release the updater can use
 

@@ -109,6 +109,11 @@ terminal script — are covered; where a fix applies to only one, it says so.
 
 ### Changed
 
+- The `repository` field now names `M007-Net/hugging-face-downloader`, so the
+  in-app updater is armed rather than switched off. While the repository is
+  private the check is answered with a 404 and fails silently — no banner, no
+  download. Setting the field back to the `YOUR_GITHUB_USERNAME` placeholder
+  switches update checks off entirely, which is what a fork should do.
 - Repository listing failures now distinguish 401, 403, 404, 429, and 5xx instead of
   surfacing one raw .NET message for all of them.
 - Every page rebuild preserves keyboard focus, the caret, and the file list's scroll
