@@ -22,7 +22,7 @@ jobs:
     steps:
       # Actions are pinned to commit SHAs rather than tags: a tag can be moved
       # to point at different code. Dependabot keeps these current.
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       # The interpreter is chosen inside `run`, not with `shell:`. A `shell:` value is
@@ -35,16 +35,23 @@ jobs:
         run: ${{ matrix.shell }} -NoProfile -ExecutionPolicy Bypass -File ./tests/run-tests.ps1
 
   desktop:
-    name: Desktop (core + UI)
+    name: Desktop (node ${{ matrix.node }})
     runs-on: windows-latest
     timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      # package.json declares "node": ">=20", so the floor is tested as well as a
+      # current LTS. Testing only the newest would let the declared floor rot - which
+      # is exactly how `npm test` came to be broken on 20 without anyone noticing.
+      matrix:
+        node: [20, 22]
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
-          node-version: 20
+          node-version: ${{ matrix.node }}
           cache: npm
       # ELECTRON_SKIP_BINARY_DOWNLOAD keeps CI off the ~100MB Electron binary:
       # these suites exercise core.cjs and the static UI, neither of which

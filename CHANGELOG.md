@@ -125,6 +125,15 @@ terminal script — are covered; where a fix applies to only one, it says so.
 
 ### Changed
 
+- **CI runs on a supported action runtime, and tests the Node floor it claims.**
+  `actions/checkout` and `actions/setup-node` were pinned to v4, which targets the
+  Node 20 action runtime; runners now force those onto Node 24 and warn about it.
+  They are pinned to v7.0.1 and v7.0.0 by commit SHA. The desktop job also ran on
+  Node 20 alone, so it is now a matrix over 20 and 22 — `package.json` declares
+  `>=20`, and testing only the newest version is how the floor came to be broken
+  without anyone noticing. Verified in a scratch repository, against an unchanged
+  control, before being applied here.
+
 - **CI never ran.** `test.yml` set `shell: ${{ matrix.shell }}`, but a `shell:` value
   is validated before the matrix expands, so the workflow failed at startup on every
   commit: no jobs, and it appeared in Actions under its file path instead of its name.
