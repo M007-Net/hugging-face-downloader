@@ -40,6 +40,126 @@ $script:ConfiguredAria2 = $Aria2Path
 
 # ---------------------------------------------------------------- helpers ---
 
+# aria2 takes --disable-ipv6=true, but .NET has no equivalent switch, so the
+# repo listing and size probes could still leave over IPv6 while the transfers
+# stay on IPv4. Refuse IPv6 candidates in the bind callback instead: throwing
+# here makes .NET move on to the next address rather than fail the request.
+function Enable-IPv4Only {
+    param([string[]]$Hosts = @('huggingface.co', 'www.huggingface.co', 'hf.co', 'www.hf.co'))
+    $refuseIPv6 = [Net.BindIPEndPoint]{
+        param($servicePoint, $remoteEndPoint, $retryCount)
+        if ($remoteEndPoint.AddressFamily -eq [Net.Sockets.AddressFamily]::InterNetworkV6) {
+            throw [InvalidOperationException]::new('IPv6 is disabled for Hugging Face transfers.')
+        }
+        return $null
+    }
+    foreach ($hostName in $Hosts) {
+        try { [Net.ServicePointManager]::FindServicePoint([uri]("https://$hostName")).BindIPEndPointDelegate = $refuseIPv6 } catch { }
+    }
+}
+
+# A token travels to aria2 as a header line on stdin. A control character in it
+# would end that line early and let whatever followed be read as another option,
+# so anything that cannot appear in a real token is refused rather than escaped.
+function Assert-ValidToken {
+    param([string]$Value)
+    if ($Value -match '[\x00-\x1F\x7F]' -or $Value.Length -gt 4096) {
+        throw 'The Hugging Face token contains invalid characters.'
+    }
+    return $Value
+}
+
+# huggingface.co is the only host that may ever see the bearer token.
+function Assert-HFUrl {
+    param([string]$Url)
+    $parsed = $null
+    if (-not [uri]::TryCreate($Url, [UriKind]::Absolute, [ref]$parsed) -or
+        $parsed.Scheme -ne 'https' -or $parsed.Host -ne 'huggingface.co' -or $parsed.UserInfo) {
+        throw 'Unexpected file-list destination.'
+    }
+    return $parsed.AbsoluteUri
+}
+
+# .NET does not drop a hand-set Authorization header when it follows a redirect,
+# so the hops are walked here instead and each one is checked before the next
+# request carries the token to it.
+function Invoke-HFApiRequest {
+    param([string]$Url, [hashtable]$Headers)
+    $current = Assert-HFUrl $Url
+    for ($hop = 0; $hop -lt 5; $hop++) {
+        try {
+            return Invoke-WebRequest -Uri $current -Headers $Headers -UseBasicParsing `
+                                     -MaximumRedirection 0 -TimeoutSec 60 -ErrorAction Stop
+        } catch {
+            $response = $_.Exception.Response
+            if (-not $response) { throw }
+            $status = [int]$response.StatusCode
+            if ($status -lt 300 -or $status -gt 399) { throw }
+            $location = $response.Headers['Location']
+            if ($location -is [array]) { $location = $location[0] }
+            if (-not $location) { throw }
+            $current = Assert-HFUrl ([uri]::new([uri]$current, [string]$location)).AbsoluteUri
+        }
+    }
+    throw 'Too many redirects while listing the repository.'
+}
+
+function Get-FileSha256 {
+    param([string]$Path)
+    return (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLowerInvariant()
+}
+
+# Running out of disk half way through a 40 GB model wastes the whole transfer,
+# and aria2 reports it as an ordinary write failure. Check up front instead.
+# Unknown free space is not a reason to refuse - only a known shortfall is.
+function Assert-FreeSpace {
+    param([string]$DestDir, [int64]$Needed)
+    if ($Needed -le 0) { return }
+    $free = $null
+    try {
+        $root = [IO.Path]::GetPathRoot([IO.Path]::GetFullPath($DestDir))
+        $free = (New-Object IO.DriveInfo $root).AvailableFreeSpace
+    } catch { return }
+    if ($null -eq $free) { return }
+    $headroom = $Needed + [int64]($Needed * 0.05)
+    if ($free -lt $headroom) {
+        throw ('Not enough free disk space: about {0} needed, {1} available.' -f `
+               (Format-Size $headroom), (Format-Size $free))
+    }
+}
+
+# Two runs writing the same repo folder would resume each other's .part files
+# and race on the rename. The lock is one file in the destination; a lock left
+# behind by a killed run goes stale after an hour and is cleared.
+function Lock-Destination {
+    param([string]$DestDir)
+    $filename = Join-Path $DestDir '.hugging-face-downloader.lock'
+    foreach ($attempt in 1, 2) {
+        try {
+            return [pscustomobject]@{
+                Path   = $filename
+                Handle = [IO.File]::Open($filename, [IO.FileMode]::CreateNew,
+                                         [IO.FileAccess]::Write, [IO.FileShare]::None)
+            }
+        } catch {
+            if ($attempt -eq 1 -and (Test-Path -LiteralPath $filename) -and
+                ((Get-Date) - (Get-Item -LiteralPath $filename).LastWriteTime).TotalHours -gt 1) {
+                Remove-Item -LiteralPath $filename -Force -ErrorAction SilentlyContinue
+                continue
+            }
+            throw 'Another download is already running in this folder.'
+        }
+    }
+    throw 'Could not lock the destination folder.'
+}
+
+function Unlock-Destination {
+    param($Lock)
+    if (-not $Lock) { return }
+    try { $Lock.Handle.Dispose() } catch { }
+    Remove-Item -LiteralPath $Lock.Path -Force -ErrorAction SilentlyContinue
+}
+
 function Write-Info  { param($m) Write-Host $m -ForegroundColor Cyan }
 function Write-Ok    { param($m) Write-Host $m -ForegroundColor Green }
 function Write-Warn2 { param($m) Write-Host $m -ForegroundColor Yellow }
@@ -155,7 +275,7 @@ function Install-Aria2 {
 
 function Get-HFToken {
     foreach ($v in @($env:HF_TOKEN, $env:HUGGING_FACE_HUB_TOKEN, $env:HUGGINGFACE_TOKEN)) {
-        if ($v) { return $v.Trim() }
+        if ($v) { return (Assert-ValidToken $v.Trim()) }
     }
     $tokenFile = $env:HF_TOKEN_PATH
     if (-not $tokenFile) {
@@ -168,7 +288,7 @@ function Get-HFToken {
     }
     if (Test-Path -LiteralPath $tokenFile) {
         $t = (Get-Content -LiteralPath $tokenFile -Raw).Trim()
-        if ($t) { return $t }
+        if ($t) { return (Assert-ValidToken $t) }
     }
     return $null
 }
@@ -195,12 +315,22 @@ function ConvertFrom-HFLink {
     $s = $s -replace '^(https?://)?(www\.)?hf\.co/', ''
     $s = $s.TrimStart('/')
 
-    $parts = @($s -split '/' | Where-Object { $_ -ne '' })
+    # Decode once, here, so every later stage sees real text. Doing it further
+    # down meant the revision segment was never decoded at all: an encoded branch
+    # such as "feature%2Ffoo" was re-escaped on the way out as "feature%252Ffoo"
+    # and the API answered 404.
+    $parts = @($s -split '/' | Where-Object { $_ -ne '' } |
+               ForEach-Object { [uri]::UnescapeDataString($_) })
     if ($parts.Count -eq 0) { return $null }
 
     $kind = 'models'
-    if ($parts[0] -eq 'datasets') { $kind = 'datasets'; $parts = $parts[1..($parts.Count - 1)] }
-    elseif ($parts[0] -eq 'spaces') { $kind = 'spaces';  $parts = $parts[1..($parts.Count - 1)] }
+    # Guard the slice: PowerShell reads 1..0 as @(1, 0), so an unguarded
+    # $parts[1..($parts.Count - 1)] on a single-element array keeps element 0
+    # and "huggingface.co/datasets" parses as a repo literally named datasets.
+    if ($parts[0] -eq 'datasets' -or $parts[0] -eq 'spaces') {
+        $kind  = $parts[0]
+        $parts = @(if ($parts.Count -gt 1) { $parts[1..($parts.Count - 1)] })
+    }
 
     if ($parts.Count -eq 0) { return $null }
 
@@ -208,11 +338,11 @@ function ConvertFrom-HFLink {
     if ($parts.Count -ge 2 -and $parts[1] -notin @('blob', 'resolve', 'tree', 'raw')) {
         $repo = $parts[0] + '/' + $parts[1]
         $rest = @()
-        if ($parts.Count -gt 2) { $rest = $parts[2..($parts.Count - 1)] }
+        if ($parts.Count -gt 2) { $rest = @($parts[2..($parts.Count - 1)]) }
     } else {
         $repo = $parts[0]
         $rest = @()
-        if ($parts.Count -gt 1) { $rest = $parts[1..($parts.Count - 1)] }
+        if ($parts.Count -gt 1) { $rest = @($parts[1..($parts.Count - 1)]) }
     }
 
     $rev  = 'main'
@@ -222,15 +352,19 @@ function ConvertFrom-HFLink {
     if ($rest.Count -gt 0) {
         $verb = $rest[0]
         if ($verb -in @('blob', 'resolve', 'tree', 'raw')) {
-            $rest = if ($rest.Count -gt 1) { $rest[1..($rest.Count - 1)] } else { @() }
+            # Every slice is re-wrapped in @(). A PowerShell range that yields one
+            # element collapses to that element, and indexing a bare string returns
+            # its first character: a link ending right after the revision, such as
+            # /tree/main, used to come back with a revision of "m".
+            $rest = @(if ($rest.Count -gt 1) { $rest[1..($rest.Count - 1)] })
             if ($rest.Count -gt 0) {
                 # branch names like refs/pr/3 span three segments
                 if ($rest[0] -eq 'refs' -and $rest.Count -ge 3) {
                     $rev  = ($rest[0..2]) -join '/'
-                    $rest = if ($rest.Count -gt 3) { $rest[3..($rest.Count - 1)] } else { @() }
+                    $rest = @(if ($rest.Count -gt 3) { $rest[3..($rest.Count - 1)] })
                 } else {
                     $rev  = $rest[0]
-                    $rest = if ($rest.Count -gt 1) { $rest[1..($rest.Count - 1)] } else { @() }
+                    $rest = @(if ($rest.Count -gt 1) { $rest[1..($rest.Count - 1)] })
                 }
             }
             $path = ($rest -join '/')
@@ -240,7 +374,6 @@ function ConvertFrom-HFLink {
 
     $prefix = switch ($kind) { 'datasets' { 'datasets/' } 'spaces' { 'spaces/' } default { '' } }
     if ($repo -notmatch '^[a-zA-Z0-9_-][a-zA-Z0-9_.-]*(/[a-zA-Z0-9_-][a-zA-Z0-9_.-]*)?$') { return $null }
-    $path = [uri]::UnescapeDataString($path)
     if ($path) { Assert-SafeRelativePath $path }
 
     return [pscustomobject]@{
@@ -265,13 +398,48 @@ function Get-HFTree {
     if ($Info.Path) { $url += '/' + (($Info.Path -split '/' | ForEach-Object { [uri]::EscapeDataString($_) }) -join '/') }
     $url += '?recursive=true&expand=false'
 
-    $all = New-Object System.Collections.Generic.List[object]
-    $guard = 0
-    while ($url -and $guard -lt 50) {
-        $guard++
-        $resp = Invoke-WebRequest -Uri $url -Headers $headers -UseBasicParsing -MaximumRedirection 5
+    $all    = New-Object System.Collections.Generic.List[object]
+    $seen   = New-Object System.Collections.Generic.HashSet[string]
+    $pages  = 0
+    $script:RepoCommit = ''
+
+    while ($url) {
+        # The next-page URL comes from the server, so every hop is re-checked
+        # rather than trusted. A server that keeps pointing back at itself would
+        # otherwise spin until the page cap, and a host swap would hand the
+        # bearer token to somewhere it does not belong.
+        if (++$pages -gt 100) { throw 'This repository has too many files to list completely.' }
+        $url = Assert-HFUrl $url
+        if (-not $seen.Add($url)) { throw 'The file list kept repeating itself; stopping.' }
+
+        $resp = Invoke-HFApiRequest -Url $url -Headers $headers
+
+        # Pin the listing to the commit it came from. Without this a branch that
+        # moves between the listing and the download hands back different bytes
+        # than the ones whose sizes and hashes were just shown.
+        if (-not $script:RepoCommit) {
+            $commit = $resp.Headers['x-repo-commit']
+            if ($commit -is [array]) { $commit = $commit[0] }
+            $commit = ([string]$commit).Trim().ToLowerInvariant()
+            if ($commit -match '^[0-9a-f]{40}$') { $script:RepoCommit = $commit }
+        }
+
         $page = $resp.Content | ConvertFrom-Json
-        foreach ($e in $page) { $all.Add($e) | Out-Null }
+        foreach ($e in $page) {
+            # LFS entries carry the SHA-256 of the real file. Keep it where one
+            # exists so the transfer has something to verify against; plain git
+            # blobs have only a SHA-1 tree hash, which is not that.
+            $digest = ''
+            if ($e.PSObject.Properties['lfs'] -and $e.lfs) {
+                foreach ($candidate in @($e.lfs.sha256, $e.lfs.oid)) {
+                    if ($candidate) { $digest = ([string]$candidate) -replace '^(?i:sha256:)', ''; break }
+                }
+            }
+            if ($digest -notmatch '^[0-9a-fA-F]{64}$') { $digest = '' }
+            Add-Member -InputObject $e -NotePropertyName 'sha256' `
+                       -NotePropertyValue $digest.ToLowerInvariant() -Force
+            $all.Add($e) | Out-Null
+        }
 
         $url = $null
         $linkHeader = $resp.Headers['Link']
@@ -287,22 +455,58 @@ function Assert-SafeRelativePath {
     param([string]$Path)
     if (-not $Path -or [IO.Path]::IsPathRooted($Path) -or $Path -match '[\\:<>"|?*\x00-\x1F]') { throw 'Unsafe repository file path.' }
     foreach ($segment in $Path.Split('/')) {
-        if (-not $segment -or $segment -in @('.', '..') -or $segment -match '[. ]$' -or
-            $segment -match '^(?i:CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])(?:\.|$)') { throw 'Unsafe repository file path.' }
+        # The console device names and the superscript digit forms of COM/LPT are
+        # reserved too, and NTFS caps a single name component at 255 characters.
+        if (-not $segment -or $segment.Length -gt 255 -or $segment -in @('.', '..') -or
+            $segment -match '[. ]$' -or
+            $segment -match '^(?i:CON|PRN|AUX|NUL|CONIN\$|CONOUT\$|COM[1-9¹²³]|LPT[1-9¹²³])(?:\.|$)') {
+            throw 'Unsafe repository file path.'
+        }
     }
 }
 
 function Get-RemoteSize {
     param([string]$Url, [string]$Token)
+    # Deliberately do not follow the redirect. huggingface.co answers the first
+    # hop with x-linked-size, the true size of an LFS file, and staying on that
+    # host keeps the request inside the IPv4 pin above; the redirect target is a
+    # CDN hostname that varies. Content-Length here is only the LFS pointer, so
+    # it counts only when the file came back inline with a 200.
+    $h = @{ 'User-Agent' = 'hf-download-ps/1.0' }
+    if ($Token) { $h['Authorization'] = "Bearer $Token" }
+
+    # First hop, no redirect. Every LFS file - which is every model weight worth
+    # measuring - gets x-linked-size here, so the probe that matters never leaves
+    # the host the IPv4 pin covers. Depending on the status code PS 5.1 either
+    # returns this response or throws with it attached, so read both.
+    $headers = $null
     try {
-        $h = @{ 'User-Agent' = 'hf-download-ps/1.0' }
-        if ($Token) { $h['Authorization'] = "Bearer $Token" }
+        $headers = (Invoke-WebRequest -Uri $Url -Method Head -Headers $h -UseBasicParsing `
+                                      -MaximumRedirection 0 -TimeoutSec 20 -ErrorAction Stop).Headers
+    } catch {
+        if ($_.Exception.Response) { $headers = $_.Exception.Response.Headers }
+    }
+    if ($headers) {
+        $commit = $headers['x-repo-commit']
+        if ($commit -is [array]) { $commit = $commit[0] }
+        $commit = ([string]$commit).Trim().ToLowerInvariant()
+        if ($commit -match '^[0-9a-f]{40}$') { $script:RepoCommit = $commit }
+
+        $linked = $headers['x-linked-size']
+        if ($linked -is [array]) { $linked = $linked[0] }
+        if ($linked) { return [int64]$linked }
+    }
+
+    # Small non-LFS files carry no x-linked-size, and Content-Length on a
+    # redirect or an error is the length of that response's own body, not the
+    # file. Follow through to the final 200 and only trust the length there.
+    try {
         $r = Invoke-WebRequest -Uri $Url -Method Head -Headers $h -UseBasicParsing `
-                               -MaximumRedirection 10 -TimeoutSec 20
-        foreach ($name in @('x-linked-size', 'Content-Length')) {
-            $v = $r.Headers[$name]
-            if ($v -is [array]) { $v = $v[0] }
-            if ($v) { return [int64]$v }
+                               -MaximumRedirection 10 -TimeoutSec 20 -ErrorAction Stop
+        if ([int]$r.StatusCode -eq 200) {
+            $length = $r.Headers['Content-Length']
+            if ($length -is [array]) { $length = $length[0] }
+            if ($length) { return [int64]$length }
         }
     } catch { }
     return $null
@@ -528,7 +732,6 @@ function Select-DownloadFiles {
 # into 16 parts. min-split-size matters: aria2 defaults to 20M, which means -s 16
 # silently does nothing on anything under ~320M.
 function Get-Aria2Args {
-    param([string]$Token)
     $a = @(
         '-x', [string]$script:TransferConnections,
         '-s', [string]$script:TransferConnections,
@@ -547,22 +750,70 @@ function Get-Aria2Args {
         '--user-agent=hf-download-ps/1.0'
     )
     $a += '--disable-ipv6=true'
-    if ($Token) { $a += "--header=Authorization: Bearer $Token" }
     return $a
 }
 
+# Every download goes through a manifest on aria2's stdin, including single ones.
+# A --header argument would put the bearer token on the command line, where any
+# other process on the machine can read it for as long as the transfer runs, and
+# a temp file would leave it on disk if the script were killed mid-download.
+function New-Aria2Manifest {
+    param([array]$Items, [string]$Token)
+    $lines = New-Object System.Collections.Generic.List[string]
+    foreach ($item in $Items) {
+        $lines.Add($item.Url)
+        # Write to .part and rename only after the bytes check out, so an
+        # interrupted transfer never leaves something at the real name that
+        # later looks finished.
+        $lines.Add('  out=' + $item.Out + '.part')
+        if ($item.PSObject.Properties['Sha256'] -and $item.Sha256) {
+            $lines.Add('  checksum=sha-256=' + $item.Sha256)
+        }
+        if ($Token) { $lines.Add('  header=Authorization: Bearer ' + $Token) }
+    }
+    return (($lines -join "`n") + "`n")
+}
+
+# A run from before .part staging left its in-progress file at the final name
+# with an .aria2 control file beside it. Adopt that rather than starting over.
+function Move-StrandedDownload {
+    param([string]$Target)
+    $partial = $Target + '.part'
+    if (Test-Path -LiteralPath $partial) { return }
+    if (-not (Test-Path -LiteralPath $Target)) { return }
+    if (-not (Test-Path -LiteralPath ($Target + '.aria2'))) { return }
+    Move-Item -LiteralPath $Target -Destination $partial -Force
+    Move-Item -LiteralPath ($Target + '.aria2') -Destination ($partial + '.aria2') -Force
+}
+
+# Is the file already on disk the file we were about to fetch? A matching size
+# is the cheap first pass. When the API gave a SHA-256 the bytes are checked
+# against it as well, because a same-size file is not necessarily the same file.
 function Test-CompleteFile {
-    param([string]$Path, $Size)
-    if (-not $Size) { return $false }
+    param([string]$Path, $Size, [string]$Sha256)
     if (-not (Test-Path -LiteralPath $Path)) { return $false }
     if (Test-Path -LiteralPath ($Path + '.aria2')) { return $false }
-    return ((Get-Item -LiteralPath $Path).Length -eq $Size)
+    if ($Size -and (Get-Item -LiteralPath $Path).Length -ne $Size) { return $false }
+    if ($Sha256) { return ((Get-FileSha256 -Path $Path) -eq $Sha256) }
+    return [bool]$Size
+}
+
+# The gate a .part file has to pass before it is promoted to the real name.
+# Unlike Test-CompleteFile this refuses a file of unknown size only when aria2
+# also left a control file behind, since the transfer itself just reported ok.
+function Test-FinishedPartial {
+    param([string]$Path, $Size, [string]$Sha256)
+    if (-not (Test-Path -LiteralPath $Path)) { return $false }
+    if (Test-Path -LiteralPath ($Path + '.aria2')) { return $false }
+    if ($Size -and (Get-Item -LiteralPath $Path).Length -ne $Size) { return $false }
+    if ($Sha256) { return ((Get-FileSha256 -Path $Path) -eq $Sha256) }
+    return $true
 }
 
 function Invoke-Aria2Download {
     param(
         [string]$Aria2,
-        [array]$Items,         # objects with .Url, .Out (relative), .Size (may be $null)
+        [array]$Items,         # objects with .Url, .Out (relative), .Size, .Sha256
         [string]$DestDir,
         [string]$Token
     )
@@ -571,6 +822,34 @@ function Invoke-Aria2Download {
     if (-not (Test-Path -LiteralPath $DestDir)) {
         New-Item -ItemType Directory -Path $DestDir -Force | Out-Null
     }
+
+    # One destination path is fetched once. A queue that named the same file twice
+    # used to be harmless; with .part staging the second copy would find the file
+    # already promoted and report a phantom failure.
+    $unique = New-Object System.Collections.Generic.List[object]
+    $seenOut = New-Object System.Collections.Generic.HashSet[string]
+    foreach ($item in $Items) { if ($seenOut.Add($item.Out)) { $unique.Add($item) | Out-Null } }
+    $Items = $unique.ToArray()
+
+    $needed = 0
+    foreach ($item in $Items) { if ($item.Size) { $needed += $item.Size } }
+    Assert-FreeSpace -DestDir $DestDir -Needed $needed
+
+    $lock = Lock-Destination -DestDir $DestDir
+    try {
+        Invoke-Aria2DownloadCore -Aria2 $Aria2 -Items $Items -DestDir $DestDir -Token $Token
+    } finally {
+        Unlock-Destination $lock
+    }
+}
+
+function Invoke-Aria2DownloadCore {
+    param(
+        [string]$Aria2,
+        [array]$Items,
+        [string]$DestDir,
+        [string]$Token
+    )
 
     $total = $Items.Count
     $knownTotal = 0
@@ -615,33 +894,48 @@ function Invoke-Aria2Download {
         Write-Host ('  [{0}/{1}] {2}{3}' -f $step, $steps, $it.Out, $sizeText) -ForegroundColor White
         Write-Rule
 
-        if (Test-CompleteFile -Path $target -Size $it.Size) {
+        if (Test-CompleteFile -Path $target -Size $it.Size -Sha256 $it.Sha256) {
             Write-Host '  already downloaded - skipping' -ForegroundColor DarkYellow
             $skipCount++
             $bytesGot += $it.Size
             continue
         }
 
-        $a2args = @($it.Url, '--dir', $DestDir, '--out', $it.Out) + (Get-Aria2Args -Token $Token)
+        Move-StrandedDownload -Target $target
+        $partial  = $target + '.part'
+        $manifest = New-Aria2Manifest -Items @($it) -Token $Token
+        $a2args   = @('--input-file=-', '--dir', $DestDir) + (Get-Aria2Args)
 
         $sw = [Diagnostics.Stopwatch]::StartNew()
-        & $Aria2 @a2args          # NOT redirected, so the progress bar animates live
+        # Only stdin is redirected; output still goes straight to the console, so
+        # the progress bar animates live.
+        $manifest | & $Aria2 @a2args
         $code = $LASTEXITCODE
         $sw.Stop()
         Clear-Line
 
-        if ($code -eq 0 -and (Test-Path -LiteralPath $target)) {
-            $len = (Get-Item -LiteralPath $target).Length
+        if ($code -eq 0 -and (Test-FinishedPartial -Path $partial -Size $it.Size -Sha256 $it.Sha256)) {
+            $len = (Get-Item -LiteralPath $partial).Length
+            Move-Item -LiteralPath $partial -Destination $target -Force
             $bytesGot += $len
             $secs = [Math]::Max($sw.Elapsed.TotalSeconds, 0.001)
-            Write-Host ('  done  {0}  in {1}  (avg {2}/s)' -f `
-                        (Format-Size $len), (Format-Duration $sw.Elapsed), (Format-Size ($len / $secs))) `
-                        -ForegroundColor Green
+            $verified = if ($it.Sha256) { '  (SHA-256 verified)' } else { '' }
+            Write-Host ('  done  {0}  in {1}  (avg {2}/s){3}' -f `
+                        (Format-Size $len), (Format-Duration $sw.Elapsed), `
+                        (Format-Size ($len / $secs)), $verified) -ForegroundColor Green
             $okCount++
         } else {
-            Write-Err ('  FAILED  (aria2c exit code {0})' -f $code)
-            if ($code -eq 3)  { Write-Warn2 '  File not found on the server (404).' }
-            if ($code -eq 22) { Write-Warn2 '  Access denied. Gated or private repo? Set HF_TOKEN and retry.' }
+            if ($code -eq 0) {
+                # aria2 was happy but the bytes were not what the listing promised.
+                # The .part file stays put so it can be looked at, and because a
+                # later run can resume it rather than restart.
+                Write-Err '  FAILED  the file did not match its expected size or SHA-256.'
+                Write-Warn2 ('  The partial download was kept at: {0}' -f $partial)
+            } else {
+                Write-Err ('  FAILED  (aria2c exit code {0})' -f $code)
+                if ($code -eq 3)  { Write-Warn2 '  File not found on the server (404).' }
+                if ($code -eq 22) { Write-Warn2 '  Access denied. Gated or private repo? Set HF_TOKEN and retry.' }
+            }
             $failed.Add($it.Out) | Out-Null
         }
     }
@@ -651,8 +945,12 @@ function Invoke-Aria2Download {
         $todo = @()
         foreach ($it in $batch) {
             $t = Join-Path $DestDir ($it.Out -replace '/', '\')
-            if (Test-CompleteFile -Path $t -Size $it.Size) { $skipCount++; $bytesGot += $it.Size }
-            else { $todo += $it }
+            if (Test-CompleteFile -Path $t -Size $it.Size -Sha256 $it.Sha256) {
+                $skipCount++; $bytesGot += $it.Size
+            } else {
+                Move-StrandedDownload -Target $t
+                $todo += $it
+            }
         }
 
         $batchBytes = 0
@@ -667,43 +965,44 @@ function Invoke-Aria2Download {
         if ($todo.Count -eq 0) {
             Write-Host '  all already downloaded - skipping' -ForegroundColor DarkYellow
         } else {
-            $lines = @()
-            foreach ($it in $todo) { $lines += $it.Url; $lines += ('  out=' + $it.Out) }
-            $listFile = Join-Path ([IO.Path]::GetTempPath()) `
-                                  ("hf-aria2-{0}.txt" -f ([guid]::NewGuid().ToString('N')))
-            [IO.File]::WriteAllLines($listFile, $lines, (New-Object Text.UTF8Encoding($false)))
+            $manifest = New-Aria2Manifest -Items $todo -Token $Token
 
-            $a2args = @('--input-file', $listFile, '--dir', $DestDir,
-                        '--max-concurrent-downloads=5') + (Get-Aria2Args -Token $Token)
+            $a2args = @('--input-file=-', '--dir', $DestDir,
+                        '--max-concurrent-downloads=5') + (Get-Aria2Args)
 
             $sw = [Diagnostics.Stopwatch]::StartNew()
-            try {
-                & $Aria2 @a2args
-                $code = $LASTEXITCODE
-            } finally {
-                Remove-Item -LiteralPath $listFile -Force -ErrorAction SilentlyContinue
-            }
+            $manifest | & $Aria2 @a2args
+            $code = $LASTEXITCODE
             $sw.Stop()
             Clear-Line
 
+            # A file on disk is not a finished file: aria2 can exit non-zero with
+            # truncated output and a leftover .aria2 control file. Judge each one
+            # the same way the solo path does, or a half-written config lands in
+            # the library reported as complete.
             $got = 0
+            $batchFailed = 0
             foreach ($it in $todo) {
                 $t = Join-Path $DestDir ($it.Out -replace '/', '\')
-                if (Test-Path -LiteralPath $t) {
+                $partial = $t + '.part'
+                if ($code -eq 0 -and (Test-FinishedPartial -Path $partial -Size $it.Size -Sha256 $it.Sha256)) {
                     $got++
-                    $bytesGot += (Get-Item -LiteralPath $t).Length
+                    $bytesGot += (Get-Item -LiteralPath $partial).Length
+                    Move-Item -LiteralPath $partial -Destination $t -Force
                 } else {
+                    $batchFailed++
                     $failed.Add($it.Out) | Out-Null
                 }
             }
             $okCount += $got
 
-            if ($failed.Count -eq 0) {
+            # Count only this batch: $failed already holds the solo failures above.
+            if ($batchFailed -eq 0) {
                 Write-Host ('  done  {0} files  in {1}' -f $got, (Format-Duration $sw.Elapsed)) `
                            -ForegroundColor Green
             } else {
                 Write-Err ('  {0} of {1} small files failed (aria2c exit code {2})' -f `
-                           ($todo.Count - $got), $todo.Count, $code)
+                           $batchFailed, $todo.Count, $code)
             }
         }
     }
@@ -739,13 +1038,16 @@ function Invoke-OneLink {
     Write-Host ''
     Write-Info ('Repo: {0}  ({1}, branch {2})' -f $info.Repo, $info.Kind, $info.Rev)
 
+    # Cleared per link so a repo that reports no commit cannot inherit the one
+    # from the previous link in the same session.
+    $script:RepoCommit = ''
     $encRev = ($info.Rev -split '/' | ForEach-Object { [uri]::EscapeDataString($_) }) -join '/'
     $items  = @()
     # Mirror Hugging Face's owner/repository layout, which is also LM Studio's
     # normal library layout. It prevents files from separate repos colliding,
     # while keeping MTP, mmproj/vision, tokenizer, and other companion files
     # together with the GGUF that uses them.
-    $dest   = Join-Path $ModelsDir (($info.Repo -replace '/', '\\'))
+    $dest   = Join-Path $ModelsDir ($info.Repo -replace '/', '\')
     if ($info.Kind -ne 'models') { $dest = Join-Path (Join-Path $ModelsDir $info.Kind) ($info.Repo -replace '/', '\') }
 
     if ($info.IsFile) {
@@ -753,13 +1055,19 @@ function Invoke-OneLink {
         $fileUrl = "$($info.WebBase)/resolve/$encRev/$encPath`?download=true"
         Write-Host 'Checking file size...' -ForegroundColor DarkGray
         $size = Get-RemoteSize -Url $fileUrl -Token $Token
+        # The probe above may have reported the commit this branch points at.
+        # Pin to it so the bytes fetched are the ones that were just measured.
+        if ($script:RepoCommit) {
+            $fileUrl = "$($info.WebBase)/resolve/$($script:RepoCommit)/$encPath`?download=true"
+        }
         $items = @([pscustomobject]@{
             Url  = $fileUrl
             # Retain a direct-link file's repo-relative path too. For example,
             # an MTP/ or vision/ companion remains beside its main model rather
             # than being flattened into the repository root.
-            Out  = $info.Path
-            Size = $size
+            Out    = $info.Path
+            Size   = $size
+            Sha256 = ''
         })
     } else {
         Write-Info 'Listing repo files...'
@@ -788,13 +1096,23 @@ function Invoke-OneLink {
         $picked = @(Select-DownloadFiles -Files $files -CompanionFiles $companionFiles)
         if ($picked.Count -eq 0) { Write-Warn2 'Nothing selected.'; return }
 
+        # Download from the exact commit the listing came from. A branch that
+        # moves between listing and download would otherwise hand back different
+        # bytes than the sizes and hashes shown a moment ago.
+        if ($script:RepoCommit) {
+            $encRev = $script:RepoCommit
+            Write-Host ('  Pinned to commit {0}' -f $script:RepoCommit.Substring(0, 12)) -ForegroundColor DarkGray
+        }
+
         foreach ($f in $picked) {
             $encPath = ($f.path -split '/' | ForEach-Object { [uri]::EscapeDataString($_) }) -join '/'
-            $out = $f.path
+            $digest = ''
+            if ($f.PSObject.Properties['sha256']) { $digest = [string]$f.sha256 }
             $items += [pscustomobject]@{
-                Url  = "$($info.WebBase)/resolve/$encRev/$encPath`?download=true"
-                Out  = $out
-                Size = $f.size
+                Url    = "$($info.WebBase)/resolve/$encRev/$encPath`?download=true"
+                Out    = $f.path
+                Size   = $f.size
+                Sha256 = $digest
             }
         }
     }
@@ -807,6 +1125,7 @@ Write-Host '=========================================' -ForegroundColor DarkCyan
 Write-Host '  Hugging Face -> aria2c downloader'       -ForegroundColor DarkCyan
 Write-Host '=========================================' -ForegroundColor DarkCyan
 
+Enable-IPv4Only
 $models = Get-DownloadFolder -Requested $OutputDir
 Write-Host ('Saving to: {0}' -f $models) -ForegroundColor DarkGray
 
