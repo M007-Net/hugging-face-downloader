@@ -7,8 +7,8 @@
   "license": "MIT",
   "engines": { "node": ">=20" },
   "private": true,
-  "//repository": "EDIT THIS: replace YOUR_GITHUB_USERNAME with your GitHub account. Until you do, the in-app updater stays switched off instead of calling out to the network. See README.md, 'Turning on the updater'.",
-  "repository": { "type": "git", "url": "https://github.com/YOUR_GITHUB_USERNAME/hugging-face-downloader" },
+  "//repository": "The in-app updater reads this field. A fork should point it at its own repository, or restore the YOUR_GITHUB_USERNAME placeholder to switch update checks off entirely. See README.md, 'Turning on the updater'.",
+  "repository": { "type": "git", "url": "https://github.com/M007-Net/hugging-face-downloader" },
   "main": "desktop/main.cjs",
   "scripts": {
     "start": "electron .",
