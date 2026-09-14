@@ -8,8 +8,12 @@ const css = read('style.css');
 const renderer = read('renderer.js');
 const main = read('main.cjs');
 const terminal = fs.readFileSync(path.join(root, 'hf-download.ps1'), 'utf8');
-const personalPath = new RegExp([['mw','wood'].join(''), ['local','-ai'].join(''), ['be','-a-fool'].join('')].join('|'), 'i');
-for (const text of [html, css, renderer, main, terminal]) assert.equal(personalPath.test(text), false, 'UI contains a personal path');
+// Nothing shipped may carry the absolute path of whatever machine it was built on.
+// Naming one developer's username caught only that person, and had to be split across
+// an array so the check did not match its own source. This asserts the real invariant:
+// no user-profile path from any platform, whoever did the build.
+const personalPath = /[A-Za-z]:\\{1,2}Users\\{1,2}[^\\/"'\s]+|\/(?:home|Users)\/[A-Za-z0-9._-]+\//i;
+for (const text of [html, css, renderer, main, terminal]) assert.equal(personalPath.test(text), false, 'A shipped file contains a developer machine path');
 for (const required of [
   'New download', 'Downloads', 'Settings', 'Open terminal version', 'Download a model from Hugging Face',
   'A little guidance', 'Choose quantization', 'Choose specific files', 'Optional companions',
