@@ -24,7 +24,14 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+# -bor, not =. Assigning removes TLS 1.3 from the enabled set on Windows PowerShell,
+# where the previous line left only TLS 1.2 available.
+[Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+# $OutputEncoding governs the bytes PowerShell writes to a native process's stdin, and
+# Windows PowerShell defaults it to ASCII. The aria2 manifest travels that way, so every
+# non-ASCII character in an "out=" line became "?" - which is itself illegal in a Windows
+# filename, so a repository holding "modèle-Q4.gguf" failed with no explanation.
+$OutputEncoding = New-Object System.Text.UTF8Encoding $false
 $script:AppSettingsPath = $SettingsPath
 if (-not $script:AppSettingsPath) {
     $configRoot = [Environment]::GetFolderPath('LocalApplicationData')
@@ -80,6 +87,54 @@ function Assert-HFUrl {
     return $parsed.AbsoluteUri
 }
 
+function Get-ResponseStatus {
+    param($Response)
+    if (-not $Response) { return 0 }
+    try { return [int]$Response.StatusCode } catch { return 0 }
+}
+
+# Windows PowerShell 5.1 hands back an HttpWebResponse, whose Headers collection has a
+# string indexer. PowerShell 7 hands back an HttpResponseMessage, whose HttpResponseHeaders
+# has no indexer at all - so the 5.1 form silently returned $null under pwsh and every
+# redirect and every LFS size probe looked like a plain failure, while CI stayed green
+# because both are mocked out in the test suite.
+function Get-ResponseHeader {
+    param($Response, [string]$Name)
+    if (-not $Response) { return $null }
+    $headers = $Response.Headers
+    if (-not $headers) { return $null }
+    if ($headers -is [System.Net.WebHeaderCollection]) {
+        $value = $headers[$Name]
+        if ($value -is [array]) { if ($value.Count) { return [string]$value[0] } else { return $null } }
+        return $value
+    }
+    $values = $null
+    try { if ($headers.TryGetValues($Name, [ref]$values) -and $values) { return [string]@($values)[0] } } catch { }
+    # Content-Length and the other entity headers sit on a separate collection under pwsh.
+    try {
+        $content = $Response.Content
+        if ($content -and $content.Headers -and $content.Headers.TryGetValues($Name, [ref]$values) -and $values) { return [string]@($values)[0] }
+    } catch { }
+    return $null
+}
+
+# A 404 and a gated 403 and a rate limit are three different problems with three different
+# answers. Reporting all of them as one raw .NET message left the user guessing.
+function Get-HFAccessMessage {
+    param([int]$Status)
+    switch ($Status) {
+        401 { return 'Access denied (401). Set HF_TOKEN to a token with read access.' }
+        403 { return 'Access denied (403). The repository is gated or private: accept its terms on its Hugging Face page, and use a token with read access.' }
+        404 { return 'Repository, revision, or file not found (404). Check the link and the branch name.' }
+        429 { return 'Hugging Face is rate limiting this machine (429). Wait a minute and try again.' }
+        default {
+            if ($Status -ge 500) { return "Hugging Face returned HTTP $Status. That is a server-side error; try again shortly." }
+            if ($Status -gt 0)   { return "Hugging Face returned HTTP $Status." }
+            return 'Hugging Face could not be reached.'
+        }
+    }
+}
+
 # .NET does not drop a hand-set Authorization header when it follows a redirect,
 # so the hops are walked here instead and each one is checked before the next
 # request carries the token to it.
@@ -93,10 +148,9 @@ function Invoke-HFApiRequest {
         } catch {
             $response = $_.Exception.Response
             if (-not $response) { throw }
-            $status = [int]$response.StatusCode
-            if ($status -lt 300 -or $status -gt 399) { throw }
-            $location = $response.Headers['Location']
-            if ($location -is [array]) { $location = $location[0] }
+            $status = Get-ResponseStatus $response
+            if ($status -lt 300 -or $status -gt 399) { throw (Get-HFAccessMessage $status) }
+            $location = Get-ResponseHeader $response 'Location'
             if (-not $location) { throw }
             $current = Assert-HFUrl ([uri]::new([uri]$current, [string]$location)).AbsoluteUri
         }
@@ -147,6 +201,12 @@ function Lock-Destination {
                 Remove-Item -LiteralPath $filename -Force -ErrorAction SilentlyContinue
                 continue
             }
+            # Contention is only one reason this can fail. A read-only folder, a denied
+            # ACL, a full disk and an offline share all landed here too, and all of them
+            # sent the user looking for a download that was not running.
+            if (-not (Test-Path -LiteralPath $filename)) {
+                throw ('Could not write to the download folder: {0}' -f $_.Exception.Message)
+            }
             throw 'Another download is already running in this folder.'
         }
     }
@@ -187,7 +247,9 @@ function Get-DownloaderSettings {
 function Save-DownloaderSettings {
     param([hashtable]$Settings)
     $parent = Split-Path -Parent ([IO.Path]::GetFullPath($script:AppSettingsPath))
-    New-Item -ItemType Directory -Path $parent -Force | Out-Null
+    # Not New-Item: it has no -LiteralPath in Windows PowerShell, and its -Path treats
+    # [ and ] as a wildcard, so a folder such as D:\Models[new] is silently never made.
+    [IO.Directory]::CreateDirectory($parent) | Out-Null
     $Settings | ConvertTo-Json | Set-Content -LiteralPath $script:AppSettingsPath -Encoding UTF8
 }
 
@@ -465,7 +527,7 @@ function Assert-SafeRelativePath {
     }
 }
 
-function Get-RemoteSize {
+function Get-RemoteFileInfo {
     param([string]$Url, [string]$Token)
     # Deliberately do not follow the redirect. huggingface.co answers the first
     # hop with x-linked-size, the true size of an LFS file, and staying on that
@@ -479,37 +541,59 @@ function Get-RemoteSize {
     # measuring - gets x-linked-size here, so the probe that matters never leaves
     # the host the IPv4 pin covers. Depending on the status code PS 5.1 either
     # returns this response or throws with it attached, so read both.
-    $headers = $null
+    $response = $null
     try {
-        $headers = (Invoke-WebRequest -Uri $Url -Method Head -Headers $h -UseBasicParsing `
-                                      -MaximumRedirection 0 -TimeoutSec 20 -ErrorAction Stop).Headers
+        $response = Invoke-WebRequest -Uri $Url -Method Head -Headers $h -UseBasicParsing `
+                                      -MaximumRedirection 0 -TimeoutSec 20 -ErrorAction Stop
     } catch {
-        if ($_.Exception.Response) { $headers = $_.Exception.Response.Headers }
+        if ($_.Exception.Response) { $response = $_.Exception.Response }
     }
-    if ($headers) {
-        $commit = $headers['x-repo-commit']
-        if ($commit -is [array]) { $commit = $commit[0] }
-        $commit = ([string]$commit).Trim().ToLowerInvariant()
+    $size = $null
+    $digest = ''
+    if ($response) {
+        $commit = ([string](Get-ResponseHeader $response 'x-repo-commit')).Trim().ToLowerInvariant()
         if ($commit -match '^[0-9a-f]{40}$') { $script:RepoCommit = $commit }
 
-        $linked = $headers['x-linked-size']
-        if ($linked -is [array]) { $linked = $linked[0] }
-        if ($linked) { return [int64]$linked }
+        # For an LFS object the ETag is the SHA-256 of the content, which is the only
+        # digest a direct file link can be verified against.
+        foreach ($name in @('x-linked-etag', 'ETag')) {
+            $tag = ([string](Get-ResponseHeader $response $name)).Trim().Trim('"').TrimStart('W/').Trim('"')
+            if ($tag -match '^[0-9a-f]{64}$') { $digest = $tag.ToLowerInvariant(); break }
+        }
+
+        $linked = Get-ResponseHeader $response 'x-linked-size'
+        if ($linked) { $size = [int64]$linked }
     }
 
     # Small non-LFS files carry no x-linked-size, and Content-Length on a
     # redirect or an error is the length of that response's own body, not the
     # file. Follow through to the final 200 and only trust the length there.
-    try {
-        $r = Invoke-WebRequest -Uri $Url -Method Head -Headers $h -UseBasicParsing `
-                               -MaximumRedirection 10 -TimeoutSec 20 -ErrorAction Stop
-        if ([int]$r.StatusCode -eq 200) {
-            $length = $r.Headers['Content-Length']
-            if ($length -is [array]) { $length = $length[0] }
-            if ($length) { return [int64]$length }
-        }
-    } catch { }
-    return $null
+    #
+    # The follow-through used to be -MaximumRedirection 10 with $h still attached.
+    # Windows PowerShell 5.1 does not strip a hand-set Authorization header across a
+    # redirect, so that handed the bearer token to whichever CDN host answered - the
+    # exact thing Invoke-HFApiRequest exists to prevent. Resolve-HFDownload walks the
+    # chain properly and drops the credential the moment it leaves huggingface.co.
+    if ($null -eq $size) {
+        try {
+            $resolved = Resolve-HFDownload -Url $Url -Token $Token
+            $final = @{ 'User-Agent' = 'hf-download-ps/1.0' }
+            if ($resolved.SendToken -and $Token) { $final['Authorization'] = "Bearer $Token" }
+            $r = Invoke-WebRequest -Uri $resolved.Url -Method Head -Headers $final -UseBasicParsing `
+                                   -MaximumRedirection $resolved.MaxRedirect -TimeoutSec 20 -ErrorAction Stop
+            if ((Get-ResponseStatus $r) -eq 200) {
+                $length = Get-ResponseHeader $r 'Content-Length'
+                if ($length) { $size = [int64]$length }
+            }
+        } catch { }
+    }
+    return [pscustomobject]@{ Size = $size; Sha256 = $digest }
+}
+
+# Kept for callers that only want the number.
+function Get-RemoteSize {
+    param([string]$Url, [string]$Token)
+    return (Get-RemoteFileInfo -Url $Url -Token $Token).Size
 }
 
 function Select-FilesFromTree {
@@ -557,9 +641,15 @@ function Select-FilesFromTree {
 function Get-QuantName {
     param([string]$Path)
     # Prefer the filename; fall back to a quant-named parent directory.
-    $pattern = '(?i)(?<![a-z0-9])((?:UD-)?(?:IQ[1-8](?:_[A-Z0-9]+)*|Q[1-8](?:_[A-Z0-9]+)*|TQ[12]_0|MXFP4|NVFP4|BF16|FP16|F16|F32))(?![a-z0-9])'
+    $pattern = '(?<![a-z0-9])((?:UD-)?(?:IQ[1-8](?:_[A-Z0-9]+)*|Q[1-8](?:_[A-Z0-9]+)*|TQ[12]_0|MXFP4|NVFP4|BF16|FP16|F16|F32))(?![a-z0-9])'
+    # IgnoreCase on its own is culture-sensitive in .NET, and there is no inline flag for
+    # culture invariance. On a Turkish or Azerbaijani system the dotless I means "IQ" does
+    # not match "iq", so a perfectly ordinary repository reported no recognized
+    # quantizations at all. Every token here is ASCII, so invariant is simply correct.
+    $options = [Text.RegularExpressions.RegexOptions]'IgnoreCase, CultureInvariant'
     foreach ($part in @($Path.Split('/') | Select-Object -Last 1) + @($Path.Split('/'))) {
-        if ($part -match $pattern) { return $Matches[1].ToUpperInvariant() }
+        $match = [regex]::Match($part, $pattern, $options)
+        if ($match.Success) { return $match.Groups[1].Value.ToUpperInvariant() }
     }
     return ''
 }
@@ -575,11 +665,15 @@ function Get-QuantBits {
 
 function Get-CompanionKind {
     param([string]$Path)
-    if ($Path -notmatch '(?i)\.gguf$') { return '' }
-    if ($Path -match '(?i)(^|/)(mmproj|vision|vision_encoder|projector)([-_./]|$)') { return 'vision' }
+    # Invariant for the same reason as Get-QuantName: these words contain "i", and a
+    # Turkish locale does not consider "I" and "i" the same letter.
+    $options = [Text.RegularExpressions.RegexOptions]'IgnoreCase, CultureInvariant'
+    $is = { param($pattern) [regex]::IsMatch($Path, $pattern, $options) }
+    if (-not (& $is '\.gguf$')) { return '' }
+    if (& $is '(^|/)(mmproj|vision|vision_encoder|projector)([-_./]|$)') { return 'vision' }
     # A model with -MTP- in its name can contain its own MTP head. Only
     # explicit sidecar prefixes/directories are treated as separate downloads.
-    if ($Path -match '(?i)(^|/)(mtp|draft|draft_model|nextn)([-_./]|$)') { return 'MTP' }
+    if (& $is '(^|/)(mtp|draft|draft_model|nextn)([-_./]|$)') { return 'MTP' }
     return ''
 }
 
@@ -750,7 +844,54 @@ function Get-Aria2Args {
         '--user-agent=hf-download-ps/1.0'
     )
     $a += '--disable-ipv6=true'
+    # Without this aria2 reads %APPDATA%\aria2\aria2.conf and %USERPROFILE%\.aria2\aria2.conf.
+    # Such a file can set check-certificate=false, redirect dir=, or run a program through
+    # on-download-complete, none of which this script would see or report.
+    $a += '--no-conf=true'
     return $a
+}
+
+# Every /resolve/ URL for an LFS file - which is every model weight - answers with a
+# redirect to a different origin (cdn-lfs.huggingface.co, cas-bridge.xethub.hf.co and
+# friends). aria2 replays --header values on every hop, so handing it an unresolved URL
+# together with the bearer token means the token is sent to that third-party host. Those
+# CDN URLs are pre-signed and need no credential at all.
+#
+# So the chain is walked here instead, exactly as Invoke-HFApiRequest does for listings:
+# the token goes only to huggingface.co, and the moment the chain leaves that origin the
+# signed URL is handed over with no header.
+function Resolve-HFDownload {
+    param([string]$Url, [string]$Token)
+    $headers = @{ 'User-Agent' = 'hf-download-ps/1.0' }
+    if ($Token) { $headers['Authorization'] = 'Bearer ' + $Token }
+    $current = Assert-HFUrl $Url
+    for ($hop = 0; $hop -le 10; $hop++) {
+        try {
+            $null = Invoke-WebRequest -Uri $current -Method Head -Headers $headers -UseBasicParsing `
+                                      -MaximumRedirection 0 -TimeoutSec 30 -ErrorAction Stop
+            # Served straight from huggingface.co. aria2 may carry the header, but only
+            # because redirects are switched off for this item so it cannot be forwarded.
+            return [pscustomobject]@{ Url = $current; SendToken = [bool]$Token; MaxRedirect = 0 }
+        } catch {
+            $response = $_.Exception.Response
+            if (-not $response) { throw }
+            $status = Get-ResponseStatus $response
+            if ($status -lt 300 -or $status -gt 399) {
+                throw (Get-HFAccessMessage $status)
+            }
+            $location = Get-ResponseHeader $response 'Location'
+            if (-not $location) { throw 'Hugging Face returned an incomplete download redirect.' }
+            $next = [uri]::new([uri]$current, [string]$location)
+            if ($next.Scheme -ne 'https' -or $next.UserInfo) { throw 'Hugging Face returned an unsafe download address.' }
+            if ($next.Host -ne 'huggingface.co') {
+                # Left the origin: signed URL, no credential, and aria2 may follow the
+                # rest of the chain on its own because there is nothing left to leak.
+                return [pscustomobject]@{ Url = $next.AbsoluteUri; SendToken = $false; MaxRedirect = 10 }
+            }
+            $current = $next.AbsoluteUri
+        }
+    }
+    throw 'Hugging Face redirected the download too many times.'
 }
 
 # Every download goes through a manifest on aria2's stdin, including single ones.
@@ -761,15 +902,28 @@ function New-Aria2Manifest {
     param([array]$Items, [string]$Token)
     $lines = New-Object System.Collections.Generic.List[string]
     foreach ($item in $Items) {
-        $lines.Add($item.Url)
+        # Resolve-HFDownload has already walked the redirect chain, so this is either a
+        # signed CDN URL (no credential, aria2 may follow the rest) or a huggingface.co
+        # URL that answered directly. A token is emitted only in the second case, and
+        # always beside max-redirect=0 so aria2 cannot forward it anywhere.
+        $url = $item.Url
+        $sendToken = $true
+        $maxRedirect = 0
+        if ($item.PSObject.Properties['Resolved'] -and $item.Resolved) {
+            $url         = $item.Resolved.Url
+            $sendToken   = [bool]$item.Resolved.SendToken
+            $maxRedirect = [int]$item.Resolved.MaxRedirect
+        }
+        $lines.Add($url)
         # Write to .part and rename only after the bytes check out, so an
         # interrupted transfer never leaves something at the real name that
         # later looks finished.
         $lines.Add('  out=' + $item.Out + '.part')
+        $lines.Add('  max-redirect=' + $maxRedirect)
         if ($item.PSObject.Properties['Sha256'] -and $item.Sha256) {
             $lines.Add('  checksum=sha-256=' + $item.Sha256)
         }
-        if ($Token) { $lines.Add('  header=Authorization: Bearer ' + $Token) }
+        if ($Token -and $sendToken) { $lines.Add('  header=Authorization: Bearer ' + $Token) }
     }
     return (($lines -join "`n") + "`n")
 }
@@ -801,12 +955,46 @@ function Test-CompleteFile {
 # The gate a .part file has to pass before it is promoted to the real name.
 # Unlike Test-CompleteFile this refuses a file of unknown size only when aria2
 # also left a control file behind, since the transfer itself just reported ok.
+# The server chooses the relative path, so confirm the resolved target really sits inside
+# the destination, and that no directory on the way there is a symbolic link or junction
+# someone placed beforehand. Assert-SafeRelativePath rejects the obvious traversals; this
+# is the containment check that does not depend on having enumerated every trick.
+function Assert-InsideDestination {
+    param([string]$DestDir, [string]$Target)
+    $root = [IO.Path]::GetFullPath($DestDir).TrimEnd('\') + '\'
+    $full = [IO.Path]::GetFullPath($Target)
+    if (-not $full.StartsWith($root, [StringComparison]::OrdinalIgnoreCase)) {
+        throw ('The download path escaped the selected folder: {0}' -f $Target)
+    }
+    # Windows PowerShell 5.1 does not opt into long paths even where the registry enables
+    # them, and the download runs to "<name>.part", which is five characters longer than
+    # the file the user is expecting. Checking here names the file and suggests the fix,
+    # rather than failing later with a bare PathTooLongException.
+    if (($full.Length + 6) -gt 260) {
+        throw ('The full path would be {0} characters, past the {1}-character Windows limit: {2}. Choose a shorter download folder.' -f ($full.Length + 6), 260, $Target)
+    }
+    $current = $root.TrimEnd('\')
+    foreach ($segment in ($full.Substring($root.Length) -split '\\')) {
+        if (-not $segment) { continue }
+        $current = Join-Path $current $segment
+        if (-not (Test-Path -LiteralPath $current)) { break }
+        $item = Get-Item -LiteralPath $current -Force
+        if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) {
+            throw ('Refusing to write through a symbolic link or junction: {0}' -f $current)
+        }
+    }
+}
+
 function Test-FinishedPartial {
     param([string]$Path, $Size, [string]$Sha256)
     if (-not (Test-Path -LiteralPath $Path)) { return $false }
     if (Test-Path -LiteralPath ($Path + '.aria2')) { return $false }
     if ($Size -and (Get-Item -LiteralPath $Path).Length -ne $Size) { return $false }
     if ($Sha256) { return ((Get-FileSha256 -Path $Path) -eq $Sha256) }
+    # Fails closed. With neither a size nor a digest there is nothing that distinguishes a
+    # complete file from one aria2 truncated while still exiting 0, and this function's
+    # answer is what promotes a .part to its real name.
+    if (-not $Size) { return $false }
     return $true
 }
 
@@ -818,21 +1006,65 @@ function Invoke-Aria2Download {
         [string]$Token
     )
 
-    foreach ($item in $Items) { Assert-SafeRelativePath $item.Out }
+    # Hugging Face repositories are git repositories made on Linux, so a handful of names
+    # Windows cannot hold is ordinary. Throwing on the first one used to kill the whole
+    # queue after the user had already chosen every file, with a message naming neither
+    # the file nor the reason. Skip those and download the rest.
+    $safe = New-Object System.Collections.Generic.List[object]
+    $unsafe = New-Object System.Collections.Generic.List[string]
+    foreach ($item in $Items) {
+        try { Assert-SafeRelativePath $item.Out; $safe.Add($item) | Out-Null }
+        catch { $unsafe.Add([string]$item.Out) | Out-Null }
+    }
+    if ($unsafe.Count) {
+        Write-Warn2 ('{0} file(s) cannot be saved under a Windows filename and will be skipped:' -f $unsafe.Count)
+        foreach ($name in $unsafe) { Write-Warn2 ('    ' + $name) }
+    }
+    if (-not $safe.Count) { throw ('None of the {0} selected file(s) can be saved safely on Windows.' -f $Items.Count) }
+    $Items = $safe.ToArray()
+
     if (-not (Test-Path -LiteralPath $DestDir)) {
-        New-Item -ItemType Directory -Path $DestDir -Force | Out-Null
+        # See Save-DownloaderSettings: New-Item -Path would read [ ] as a wildcard.
+        [IO.Directory]::CreateDirectory($DestDir) | Out-Null
     }
 
     # One destination path is fetched once. A queue that named the same file twice
     # used to be harmless; with .part staging the second copy would find the file
     # already promoted and report a phantom failure.
+    #
+    # The comparison is case-insensitive because the filesystem is. A repository holding
+    # both Config.json and config.json is legal on Linux and one file here: with an
+    # ordinal comparer both entries survived, and in a batch they went into one manifest
+    # with the same out= line, so two aria2 workers wrote the same file at once.
     $unique = New-Object System.Collections.Generic.List[object]
-    $seenOut = New-Object System.Collections.Generic.HashSet[string]
-    foreach ($item in $Items) { if ($seenOut.Add($item.Out)) { $unique.Add($item) | Out-Null } }
+    $seenOut = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+    $collisions = New-Object System.Collections.Generic.List[string]
+    foreach ($item in $Items) {
+        if ($seenOut.Add($item.Out)) { $unique.Add($item) | Out-Null }
+        elseif ($unique.Where({ $_.Out -ceq $item.Out }, 'First').Count -eq 0) { $collisions.Add([string]$item.Out) | Out-Null }
+    }
+    if ($collisions.Count) {
+        Write-Warn2 ('{0} file(s) differ only by capitalisation from one already queued and will be skipped:' -f $collisions.Count)
+        foreach ($name in $collisions) { Write-Warn2 ('    ' + $name) }
+    }
     $Items = $unique.ToArray()
 
+    # Counted over what is actually still to fetch. Summing every item meant a 50 GB
+    # repository that was 45 GB downloaded still demanded 52 GB free, so the one thing
+    # the user needed - finishing the last 5 GB - was the thing it refused to do.
     $needed = 0
-    foreach ($item in $Items) { if ($item.Size) { $needed += $item.Size } }
+    foreach ($item in $Items) {
+        if (-not $item.Size) { continue }
+        $target = Join-Path $DestDir ($item.Out -replace '/', '\')
+        if (Test-CompleteFile -Path $target -Size $item.Size -Sha256 $item.Sha256) { continue }
+        $remaining = $item.Size
+        $partial = $target + '.part'
+        if (Test-Path -LiteralPath $partial) {
+            try { $remaining = $item.Size - (Get-Item -LiteralPath $partial).Length } catch { }
+            if ($remaining -lt 0) { $remaining = $item.Size }
+        }
+        $needed += $remaining
+    }
     Assert-FreeSpace -DestDir $DestDir -Needed $needed
 
     $lock = Lock-Destination -DestDir $DestDir
@@ -885,6 +1117,11 @@ function Invoke-Aria2DownloadCore {
     $step  = 0
 
     foreach ($it in $solo) {
+      # $ErrorActionPreference is Stop for the whole script, so a terminating error from
+      # any one file - the target open in LM Studio, a path over 260 characters, an ACL
+      # that denies the rename - used to unwind past every remaining file in the queue.
+      # One file failing is a failure of that file.
+      try {
         $step++
         $target = Join-Path $DestDir ($it.Out -replace '/', '\')
 
@@ -901,8 +1138,10 @@ function Invoke-Aria2DownloadCore {
             continue
         }
 
+        Assert-InsideDestination -DestDir $DestDir -Target $target
         Move-StrandedDownload -Target $target
         $partial  = $target + '.part'
+        $it | Add-Member -NotePropertyName Resolved -NotePropertyValue (Resolve-HFDownload -Url $it.Url -Token $Token) -Force
         $manifest = New-Aria2Manifest -Items @($it) -Token $Token
         $a2args   = @('--input-file=-', '--dir', $DestDir) + (Get-Aria2Args)
 
@@ -938,6 +1177,13 @@ function Invoke-Aria2DownloadCore {
             }
             $failed.Add($it.Out) | Out-Null
         }
+      } catch {
+        Clear-Line
+        Write-Err ('  FAILED  {0}' -f $_.Exception.Message)
+        if ($_.Exception -is [IO.PathTooLongException]) { Write-Warn2 '  The full path is too long for Windows. Choose a shorter download folder.' }
+        elseif ($_.Exception -is [IO.IOException]) { Write-Warn2 '  The file may be open in another program, such as LM Studio.' }
+        $failed.Add($it.Out) | Out-Null
+      }
     }
 
     if ($batch.Count -gt 0) {
@@ -965,6 +1211,9 @@ function Invoke-Aria2DownloadCore {
         if ($todo.Count -eq 0) {
             Write-Host '  all already downloaded - skipping' -ForegroundColor DarkYellow
         } else {
+            foreach ($item in $todo) {
+                $item | Add-Member -NotePropertyName Resolved -NotePropertyValue (Resolve-HFDownload -Url $item.Url -Token $Token) -Force
+            }
             $manifest = New-Aria2Manifest -Items $todo -Token $Token
 
             $a2args = @('--input-file=-', '--dir', $DestDir,
@@ -983,13 +1232,22 @@ function Invoke-Aria2DownloadCore {
             $got = 0
             $batchFailed = 0
             foreach ($it in $todo) {
-                $t = Join-Path $DestDir ($it.Out -replace '/', '\')
-                $partial = $t + '.part'
-                if ($code -eq 0 -and (Test-FinishedPartial -Path $partial -Size $it.Size -Sha256 $it.Sha256)) {
-                    $got++
-                    $bytesGot += (Get-Item -LiteralPath $partial).Length
-                    Move-Item -LiteralPath $partial -Destination $t -Force
-                } else {
+                # Per file, for the same reason the solo loop is: a rename that throws
+                # must not take the rest of the batch down with it.
+                try {
+                    $t = Join-Path $DestDir ($it.Out -replace '/', '\')
+                    Assert-InsideDestination -DestDir $DestDir -Target $t
+                    $partial = $t + '.part'
+                    if ($code -eq 0 -and (Test-FinishedPartial -Path $partial -Size $it.Size -Sha256 $it.Sha256)) {
+                        $got++
+                        $bytesGot += (Get-Item -LiteralPath $partial).Length
+                        Move-Item -LiteralPath $partial -Destination $t -Force
+                    } else {
+                        $batchFailed++
+                        $failed.Add($it.Out) | Out-Null
+                    }
+                } catch {
+                    Write-Err ('  {0}: {1}' -f $it.Out, $_.Exception.Message)
                     $batchFailed++
                     $failed.Add($it.Out) | Out-Null
                 }
@@ -1054,7 +1312,12 @@ function Invoke-OneLink {
         $encPath = ($info.Path -split '/' | ForEach-Object { [uri]::EscapeDataString($_) }) -join '/'
         $fileUrl = "$($info.WebBase)/resolve/$encRev/$encPath`?download=true"
         Write-Host 'Checking file size...' -ForegroundColor DarkGray
-        $size = Get-RemoteSize -Url $fileUrl -Token $Token
+        $probe  = Get-RemoteFileInfo -Url $fileUrl -Token $Token
+        $size   = $probe.Size
+        $digest = $probe.Sha256
+        if (-not $size -and -not $digest) {
+            throw 'Hugging Face reported neither a size nor a checksum for that file, so a finished download could not be told from a truncated one. Paste the repository link instead of the direct file link.'
+        }
         # The probe above may have reported the commit this branch points at.
         # Pin to it so the bytes fetched are the ones that were just measured.
         if ($script:RepoCommit) {
@@ -1067,7 +1330,10 @@ function Invoke-OneLink {
             # than being flattened into the repository root.
             Out    = $info.Path
             Size   = $size
-            Sha256 = ''
+            # For an LFS object this is the content SHA-256 from the ETag. A direct file
+            # link used to carry no digest at all, which left size as the only check -
+            # and size was allowed to be unknown, so nothing was checked.
+            Sha256 = $digest
         })
     } else {
         Write-Info 'Listing repo files...'
@@ -1087,10 +1353,17 @@ function Invoke-OneLink {
             # Search the repo root as companions often live outside the quant folder.
             $rootInfo = $info.PSObject.Copy()
             $rootInfo.Path = ''
+            # Get-HFTree clears $script:RepoCommit before its first request, so a failure
+            # here used to leave the pin blank and silently fall back to the mutable
+            # branch name - defeating the guarantee printed a few lines below. Keep the
+            # commit the folder listing established.
+            $pinnedCommit = $script:RepoCommit
             try {
                 $companionFiles = @(Get-HFTree -Info $rootInfo -Token $Token | Where-Object { $_.type -eq 'file' })
             } catch {
                 Write-Warn2 'Could not check the rest of the repository for companions; only this folder was checked.'
+            } finally {
+                if (-not $script:RepoCommit) { $script:RepoCommit = $pinnedCommit }
             }
         }
         $picked = @(Select-DownloadFiles -Files $files -CompanionFiles $companionFiles)

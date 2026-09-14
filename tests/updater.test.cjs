@@ -1,6 +1,6 @@
 const test = require('node:test');
 const assert = require('node:assert');
-const { parseRepository, compareVersions, digestFor, checkForUpdate, PLACEHOLDER_OWNER } = require('../desktop/updater.cjs');
+const { parseRepository, parseVersion, compareVersions, digestFor, checkForUpdate, PLACEHOLDER_OWNER } = require('../desktop/updater.cjs');
 
 const HASH = 'a'.repeat(64);
 const release = (over = {}) => ({
@@ -89,4 +89,33 @@ test('blockmaps and non-installer assets are never selected', async () => {
 test('an unusable release listing is reported rather than trusted', async () => {
   await assert.rejects(() => checkForUpdate({ repository: 'owner/repo', currentVersion: '0.3.0', request: async () => [] }), /unexpected release listing/i);
   await assert.rejects(() => check({ tag_name: 'nightly', name: '' }), /recognizable version number/i);
+});
+
+// The version regex used to be unanchored, so a tag could carry path separators past a
+// valid-looking "0.9.0-" prefix and steer the installer write out of the updates folder
+// and into, for example, the per-user Startup folder. The SHA-256 gate does not help:
+// an attacker who controls the release also controls the notes the digest is read from.
+test('a release tag cannot smuggle a path into the version', () => {
+  const traversal = '0.9.0-x/../../../Microsoft/Windows/Start Menu/Programs/Startup/payload';
+  assert.strictEqual(parseVersion(traversal), null, 'a tag containing a path is not a version');
+  for (const bad of ['1.0.0/../evil', '1.0.0\..\evil', '1.0.0-a/b', '1.0.0 rm -rf', '1.0.0:stream', '1.0.0\u0000']) {
+    assert.strictEqual(parseVersion(bad), null, `refused: ${JSON.stringify(bad)}`);
+  }
+  // Ordinary versions still parse, including prereleases and a leading v.
+  for (const good of ['1.0.0', 'v2.3.4', '0.3.0-rc.1', '10.20.30-beta.2']) {
+    assert.ok(parseVersion(good), `accepted: ${good}`);
+  }
+  // And the download path builder refuses anything that is not filename-shaped.
+  const main = require('node:fs').readFileSync(require('node:path').join(__dirname, '..', 'desktop', 'main.cjs'), 'utf8');
+  assert.ok(main.includes('.test(version))'), 'main.cjs constrains the version before it becomes a filename');
+  assert.ok(main.includes('Refusing an update filename that points outside'), 'main.cjs confirms the resolved path stays in the updates folder');
+});
+
+// The digest is taken as the bytes arrive; the user then reads a dialog and decides.
+// The file sits at a predictable path in the meantime, so it is read again at launch.
+test('the installer is re-hashed at the moment it is launched', () => {
+  const main = require('node:fs').readFileSync(require('node:path').join(__dirname, '..', 'desktop', 'main.cjs'), 'utf8');
+  assert.match(main, /updater\.hashFile\(update\.downloaded\)/, 'install-update re-reads the file');
+  assert.match(main, /actual !== expected/, 'and compares it against the published digest');
+  assert.ok(main.indexOf('choice.response !== 1') < main.indexOf('updater.hashFile'), 'the re-check happens after the user confirms');
 });

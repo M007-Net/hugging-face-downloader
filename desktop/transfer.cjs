@@ -48,6 +48,11 @@ function rejectNestedLinks(destination, target) {
     current = path.join(current, part);
     if (fs.existsSync(current) && fs.lstatSync(current).isSymbolicLink()) throw new Error(`Refusing to write through a symbolic link or junction: ${current}`);
   }
+  // The loop above covers the directories. The file itself, and the .part aria2 actually
+  // opens, were never checked - so a link pre-planted at <dest>/<file>.part was followed.
+  for (const leaf of [target, target + '.part']) {
+    if (fs.existsSync(leaf) && fs.lstatSync(leaf).isSymbolicLink()) throw new Error(`Refusing to write through a symbolic link or junction: ${leaf}`);
+  }
 }
 
 function availableBytes(destination) {
@@ -83,11 +88,16 @@ function acquireLock(destination) {
       return { fd, filename };
     } catch (error) {
       if (error.code !== 'EEXIST') throw error;
-      let pid = 0;
-      try { pid = Number(JSON.parse(fs.readFileSync(filename, 'utf8')).pid); } catch {}
+      let pid = 0; let created = 0;
+      try { const saved = JSON.parse(fs.readFileSync(filename, 'utf8')); pid = Number(saved.pid); created = Date.parse(saved.created); } catch {}
       let running = false;
       if (pid > 0) try { process.kill(pid, 0); running = true; } catch {}
-      if (running) throw new Error('Another downloader is already writing to this repository folder.');
+      // Windows recycles process ids aggressively, so a live pid is not proof this lock
+      // is ours. After a hard kill an unrelated process can inherit the number and the
+      // folder stays locked forever with no way to clear it from the UI. A lock older
+      // than a day is treated as stale whatever the pid says.
+      const ageHours = Number.isFinite(created) ? (Date.now() - created) / 3600000 : Infinity;
+      if (running && ageHours < 24) throw new Error('Another downloader is already writing to this repository folder. If nothing is running, delete .hugging-face-downloader.lock in that folder.');
       try { fs.unlinkSync(filename); } catch { throw new Error('A stale download lock could not be cleared.'); }
     }
   }
@@ -104,7 +114,12 @@ class Transfer extends EventEmitter {
   constructor({ resolveForFile = resolveDownload, spawnProcess = spawn } = {}) {
     super(); this.job = null; this.busy = false; this.resolveForFile = resolveForFile; this.spawnProcess = spawnProcess; this.child = null;
   }
-  publish() { this.emit('update', this.job); }
+  // Listeners write last-download.json on every tick, and that write can fail for
+  // reasons that have nothing to do with the transfer - antivirus holding the temp file,
+  // a full disk, a roaming profile. Letting that throw out of emit() unwound into the
+  // per-file catch below, which moved on to the next file without killing the aria2 that
+  // was still running, so the process was orphaned and kept writing to the same .part.
+  publish() { try { this.emit('update', this.job); } catch { /* a broken listener must not fail the download */ } }
   start(job, executable, options, token) {
     if (this.busy) throw new Error('A download is already running in this app.');
     if (!job.files?.length) throw new Error('Choose at least one file.');
@@ -128,9 +143,11 @@ class Transfer extends EventEmitter {
   async run(executable, options, token) {
     const lock = acquireLock(this.job.destination);
     try {
+      this.job.status = 'verifying'; this.publish();
       for (const file of this.job.files) {
         const target = path.join(this.job.destination, ...file.path.split('/'));
         if (target.length > 32760) throw new Error(`The destination path is too long for Windows: ${file.path}`);
+        file.status = 'verifying'; this.publish();
         rejectNestedLinks(this.job.destination, target);
         if (await fileMatches(target, file)) { file.status = 'complete'; file.completed = file.size; }
       }
@@ -157,7 +174,13 @@ class Transfer extends EventEmitter {
           const lines = [prepared.url, `  out=${path.basename(partial)}`, `  split=${connections}`, `  max-connection-per-server=${connections}`, '  min-split-size=1M', `  max-redirect=${prepared.maxRedirect}`];
           if (file.sha256) lines.push(`  checksum=sha-256=${file.sha256}`);
           for (const header of prepared.headers || []) lines.push(`  header=${header}`);
-          const child = this.spawnProcess(executable, args, { windowsHide: true, stdio: ['pipe','ignore','ignore'] });
+          // stderr was discarded, which made --console-log-level=error dead weight and
+          // turned every code aria2 reports outside the four mapped below into an
+          // unactionable "aria2 code 1". Keep the tail of it for the error message.
+          const child = this.spawnProcess(executable, args, { windowsHide: true, stdio: ['pipe','ignore','pipe'] });
+          let stderrTail = '';
+          child.stderr?.setEncoding('utf8');
+          child.stderr?.on('data', chunk => { stderrTail = (stderrTail + chunk).slice(-4096); });
           this.child = child;
           let closed = false; let result; let settled = false;
           const completion = new Promise(resolve => {
@@ -187,12 +210,19 @@ class Transfer extends EventEmitter {
           await completion; this.child = null; file.speed = 0;
           if (this.pausing) { file.status = 'paused'; this.publish(); break; }
           if (result.error) throw new Error('Could not start aria2. Check its location in Settings.');
-          if (result.code !== 0) throw new Error(describeAria2Error(result.code));
+          if (result.code !== 0) {
+            const detail = stderrTail.trim().split(/[\r\n]+/).filter(Boolean).slice(-2).join(' ');
+            throw new Error(describeAria2Error(result.code) + (detail ? ` aria2 said: ${detail}` : ''));
+          }
           file.status = 'verifying'; this.publish();
           if (!(await finishedPartial(partial, file))) throw new Error('The downloaded file failed its size or SHA-256 verification. The partial file was kept for inspection.');
           fs.renameSync(partial, target);
           file.status = 'complete'; file.completed = fs.statSync(target).size; this.publish();
         } catch (error) {
+          // Whatever went wrong, this file's aria2 must not outlive it: the next
+          // iteration overwrites this.child, and an unreferenced child keeps running,
+          // racing the retry for the same .part file and surviving app exit.
+          if (this.child) { try { this.child.kill(); } catch { /* already gone */ } this.child = null; }
           if (this.pausing) break;
           file.status = 'error'; file.speed = 0; file.error = error.message; failures.push(file); this.publish();
         }

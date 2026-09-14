@@ -37,12 +37,20 @@ function parseRepository(value) {
   const match = cleaned.match(/^(?:https?:\/\/(?:www\.)?github\.com\/)?([\w.-]+)\/([\w.-]+)$/i);
   if (!match) return null;
   const [, owner, repo] = match;
+  // [\w.-] admits "." and "..", which the URL parser would then collapse when building
+  // the api.github.com path. The host pin makes that harmless today, but a traversal
+  // primitive has no business sitting in URL construction.
+  if ([owner, repo].some(part => part === '.' || part === '..')) return null;
   if (owner === PLACEHOLDER_OWNER) return null;
   return { owner, repo };
 }
 
+// Anchored at both ends. Without the trailing $ a tag like
+// "0.9.0-x/../../../Windows/Start Menu/Programs/Startup/payload" parsed as a valid
+// 0.9.0 prerelease, and the whole raw string was carried through as `version` into a
+// filesystem path. The version a release advertises is server data, not a path.
 function parseVersion(value) {
-  const match = String(value || '').trim().replace(/^v/i, '').match(/^(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?/);
+  const match = String(value || '').trim().replace(/^v/i, '').match(/^(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?$/);
   if (!match) return null;
   return { major: Number(match[1]), minor: Number(match[2]), patch: Number(match[3]), pre: match[4] ? match[4].split('.') : [] };
 }
@@ -200,9 +208,30 @@ function downloadAsset(asset, destination, { onProgress = () => {}, timeout = 12
       });
     });
     request.on('timeout', () => request.destroy(new Error('The update download timed out.')));
-    request.on('error', reject);
+    // A socket error after the response started arrives here, not on the response, so the
+    // fail() closure above never ran: the .part file stayed on disk and its write stream
+    // stayed open. Clean up whatever exists before rejecting.
+    request.on('error', error => {
+      const partial = destination + '.part';
+      try { fs.rmSync(partial, { force: true }); } catch { /* never created */ }
+      reject(error);
+    });
     request.end();
   });
 }
 
-module.exports = { parseRepository, parseVersion, compareVersions, digestFor, checkForUpdate, downloadAsset, PLACEHOLDER_OWNER, ASSET_HOSTS };
+// The digest above describes the bytes as they arrived. The user then reads a dialog and
+// decides, which can take minutes, and the installer sits at a predictable path any
+// process running as this user can write. Re-reading it at the moment of launch is what
+// makes the dialog's promise about the file true of the file that actually runs.
+function hashFile(file) {
+  return new Promise((resolve, reject) => {
+    const hash = createHash('sha256');
+    const stream = fs.createReadStream(file);
+    stream.on('error', reject);
+    stream.on('data', chunk => hash.update(chunk));
+    stream.on('end', () => resolve(hash.digest('hex')));
+  });
+}
+
+module.exports = { parseRepository, parseVersion, compareVersions, digestFor, checkForUpdate, downloadAsset, hashFile, PLACEHOLDER_OWNER, ASSET_HOSTS };

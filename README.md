@@ -27,6 +27,7 @@ as a guided desktop app and as a terminal script that share the same rules.
 - [How downloads are verified](#how-downloads-are-verified)
 - [Troubleshooting](#troubleshooting)
 - [Development](#development)
+- [Changelog](CHANGELOG.md)
 - [License](#license)
 
 ---
@@ -128,7 +129,11 @@ There are two ways. **Option A is the easy one.**
 
 #### Option A — Run the installer
 
-1. Go to this project's **Releases** page on GitHub.
+1. Go to the **Releases** page of wherever this project is published. There is no
+   canonical URL here yet: the `repository` field in `package.json` still holds the
+   `YOUR_GITHUB_USERNAME` placeholder, which is also what keeps the in-app updater
+   switched off. See **Turning on the updater** below. If you have no release to
+   download from, use Option B and build it yourself.
 2. Download `Hugging-Face-Downloader-Setup-<version>.exe`.
 3. **Before running it, check the hash.** The installer is not code-signed, so
    this is the only way to confirm you got the file the release actually
@@ -154,10 +159,12 @@ You need [Node.js](https://nodejs.org) 20 or newer (the LTS installer is fine).
 ```powershell
 git clone https://github.com/YOUR_GITHUB_USERNAME/hugging-face-downloader.git
 cd hugging-face-downloader
-npm install
+npm ci
 ```
 
-`npm install` downloads Electron, which is roughly 100 MB, so give it a minute.
+`npm ci` downloads Electron, which is roughly 100 MB, so give it a minute. It
+installs exactly what `package-lock.json` pins; use `npm install` only if you are
+deliberately updating a dependency.
 
 Then start it with **any** of these:
 
@@ -401,10 +408,30 @@ username or on which applications you have installed.
   device names and case-insensitive collisions. A file that cannot be named
   safely is skipped and reported rather than making the whole repository
   unusable.
-- Downloads refuse to write through a symbolic link or junction that leads
-  outside the destination folder.
+- Both the desktop app and the terminal script confirm the resolved target really
+  sits inside the destination folder, and refuse to write through any symbolic
+  link or junction on the way there - whatever it points at.
+- Nothing is promoted out of `.part` unless there is something to check it
+  against. If Hugging Face reports neither a size nor a digest for a file, the
+  download is refused rather than finished on trust.
 - A folder being written to is locked, so two copies of the app cannot fight
   over the same files.
+
+### Where your token goes
+
+Your Hugging Face token reaches exactly one host: `huggingface.co`.
+
+Every large file on Hugging Face is stored with Git LFS, and a `/resolve/` URL for
+one answers with a redirect to a content delivery network on a different domain
+(`cas-bridge.xethub.hf.co` and similar). Those CDN addresses are already signed and
+need no credential. Both engines therefore walk the redirect themselves and hand
+aria2 the final signed address with **no** `Authorization` header. When Hugging Face
+serves a file directly instead, aria2 does get the header — and that download is
+given `max-redirect=0`, so it cannot forward it anywhere.
+
+The token is never put on a command line (where any other account on the machine
+could read it), never written to the settings file, and never printed. It reaches
+aria2 only through the manifest on its standard input.
 
 [SECURITY.md](SECURITY.md) covers what is and is not checked, and how to report
 a vulnerability.
@@ -432,7 +459,7 @@ Launch `Hugging Face Downloader.cmd` instead. It keeps a console open and shows
 the error.
 
 **"Desktop dependencies are not installed yet."**
-Run `npm install` in the project folder once.
+Run `npm ci` in the project folder once.
 
 **The pill says "Set up aria2".**
 Go back to [Step 1](#step-1-install-aria2-required). If aria2 is installed but
@@ -460,14 +487,17 @@ then **More info → Run anyway**.
 ## Development
 
 ```powershell
-npm install
-npm test          # Node unit tests: selection, paths, transfers, updater
-npm run qa        # Static UI, launcher, and security-wiring checks
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tests\run-tests.ps1
-npm run package   # Build the Windows installer into release\
+npm ci                  # the exact locked dependency set, the same one CI installs
+npm test                # Node unit tests: selection, paths, transfers, updater
+npm run qa              # Static UI, launcher, and security-wiring checks
+npm run test:terminal   # the PowerShell engine's offline suite
+npm run package         # Build the Windows installer into release\
 ```
 
-As of 0.3.0 that is **27 Node tests**, **134 PowerShell checks**, and the static
+`npm ci` installs from the committed `package-lock.json` and reproduces the versions
+listed in [THIRD_PARTY.md](THIRD_PARTY.md); `npm install` may resolve newer ones.
+
+As of 0.3.0 that is **33 Node tests**, **146 PowerShell checks**, and the static
 UI pass. Tests import function definitions without starting the downloader, mock
 user input and transfers, and use a checked-in listing fixture. **No test
 downloads a model, and no test reaches the network.**

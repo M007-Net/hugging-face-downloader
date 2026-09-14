@@ -54,7 +54,12 @@ function validToken(value) {
   return token;
 }
 
+// Bidirectional and zero-width formatting characters are legal in a filename and render
+// as nothing, so "payload‮gpj.exe" is shown by this app, by Explorer, and by every
+// file dialog as "payloadexe.jpg". A user who believes they picked an image runs a binary.
+const SPOOFING = /[​-‏‪-‮⁦-⁩﻿]/;
 function safePath(value) {
+  if (typeof value === 'string' && SPOOFING.test(value)) throw new Error('This repository contains a file name that uses text-direction characters to disguise its extension.');
   if (typeof value !== 'string' || !value || path.win32.isAbsolute(value) || /[\\:<>"|?*\x00-\x1f]/.test(value) ||
     value.split('/').some(s => !s || s.length > 255 || s === '.' || s === '..' || /[. ]$/.test(s) || /^(CON|PRN|AUX|NUL|CONIN\$|CONOUT\$|COM(?:[1-9]|[\u00b9\u00b2\u00b3])|LPT(?:[1-9]|[\u00b9\u00b2\u00b3]))(?:\.|$)/i.test(s))) throw new Error('This repository contains a file path Windows cannot safely save.');
   return value;

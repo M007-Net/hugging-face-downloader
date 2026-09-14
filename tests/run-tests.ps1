@@ -90,14 +90,65 @@ Assert ('--disable-ipv6=true' -in @(Get-Aria2Args)) 'IPv4-only mode cannot be di
 # leave it behind. It goes to aria2 on stdin and nowhere else.
 Assert (-not (@(Get-Aria2Args) -match 'Authorization')) 'Token is not passed as an argument'
 $digest = 'ab' * 32
+# Served directly by huggingface.co: the header may go, but only because redirects are
+# switched off for that item, so aria2 cannot forward it anywhere.
 $manifest = New-Aria2Manifest -Items @([pscustomobject]@{
-    Url = 'https://huggingface.co/a/b/resolve/main/m.gguf'; Out = 'm.gguf'; Sha256 = $digest }) -Token 'secret-token'
+    Url = 'https://huggingface.co/a/b/resolve/main/m.gguf'; Out = 'm.gguf'; Sha256 = $digest
+    Resolved = [pscustomobject]@{ Url = 'https://huggingface.co/a/b/resolve/main/m.gguf'; SendToken = $true; MaxRedirect = 0 } }) -Token 'secret-token'
 Assert ($manifest -match "`n") 'The manifest is content, not the path of a file on disk'
 Assert ($manifest -match 'header=Authorization: Bearer secret-token') 'Token travels in the manifest'
+Assert ($manifest -match '(?m)^\s+max-redirect=0\s*$') 'A manifest carrying the token forbids redirects'
 Assert ($manifest -match '(?m)^\s+out=m\.gguf\.part\s*$') 'Manifest downloads to a .part file'
 Assert ($manifest -match ('(?m)^\s+checksum=sha-256=' + $digest + '\s*$')) 'Manifest carries the LFS digest'
 $anonManifest = New-Aria2Manifest -Items @([pscustomobject]@{ Url = 'https://x/y'; Out = 'y'; Sha256 = '' }) -Token ''
 Assert ($anonManifest -notmatch 'Authorization') 'No auth header without a token'
+
+# Every LFS file - every model weight - redirects to a CDN on another origin. aria2
+# replays --header values on each hop, so an unresolved URL plus the token means the
+# token reaches that third party. Those CDN URLs are pre-signed and need no credential.
+$cdnManifest = New-Aria2Manifest -Items @([pscustomobject]@{
+    Url = 'https://huggingface.co/a/b/resolve/main/m.gguf'; Out = 'm.gguf'; Sha256 = $digest
+    Resolved = [pscustomobject]@{ Url = 'https://cas-bridge.xethub.hf.co/signed/abc'; SendToken = $false; MaxRedirect = 10 } }) -Token 'secret-token'
+Assert ($cdnManifest -notmatch 'Authorization') 'The token never reaches a host other than huggingface.co'
+Assert ($cdnManifest -notmatch 'secret-token') 'The token appears nowhere in a CDN manifest'
+Assert ($cdnManifest -match 'cas-bridge\.xethub\.hf\.co') 'The resolved signed URL is what aria2 fetches'
+# Any manifest line carrying the credential must sit beside max-redirect=0.
+foreach ($line in ($manifest -split "`n")) {
+    if ($line -match 'Authorization') { Assert ($manifest -match '(?m)^\s+max-redirect=0\s*$') 'A credential is only ever emitted with redirects disabled' }
+}
+Assert (@(Get-Aria2Args) -contains '--no-conf=true') 'A user aria2.conf cannot silently change TLS checking, the output folder, or run a program'
+
+# Neither a size nor a digest means nothing distinguishes a complete file from one
+# aria2 truncated while still exiting 0, and this answer is what promotes .part.
+$blindRoot = Join-Path ([IO.Path]::GetTempPath()) ('hf-blind-' + [guid]::NewGuid().ToString('N'))
+New-Item -ItemType Directory -Path $blindRoot -Force | Out-Null
+try {
+    $blind = Join-Path $blindRoot 'x.gguf.part'
+    Set-Content -LiteralPath $blind -Value 'partial bytes' -NoNewline
+    Assert (-not (Test-FinishedPartial -Path $blind -Size $null -Sha256 '')) 'An unverifiable download is never promoted'
+    Assert (Test-FinishedPartial -Path $blind -Size 13 -Sha256 '') 'A size that matches is still accepted'
+
+    # The server picks the relative path. Assert-SafeRelativePath rejects the traversals
+    # it knows about; this is the containment check that does not rely on that list
+    # being complete, and it is the terminal engine's half of the guarantee the desktop
+    # app makes with rejectNestedLinks.
+    $inside = Join-Path $blindRoot 'sub\model.gguf'
+    Assert-InsideDestination -DestDir $blindRoot -Target $inside
+    $escapes = @(
+        (Join-Path $blindRoot '..\outside.gguf'),
+        (Join-Path $blindRoot '..\..\outside.gguf'),
+        'C:\Windows\System32\payload.exe'
+    )
+    foreach ($escape in $escapes) {
+        $blocked = $false
+        try { Assert-InsideDestination -DestDir $blindRoot -Target $escape } catch { $blocked = $true }
+        Assert $blocked ('A path outside the destination is refused: ' + $escape)
+    }
+    # A sibling folder whose name merely starts with the destination's name is outside it.
+    $blocked = $false
+    try { Assert-InsideDestination -DestDir $blindRoot -Target ($blindRoot + 'x\model.gguf') } catch { $blocked = $true }
+    Assert $blocked 'A sibling folder sharing a name prefix is not inside the destination'
+} finally { Remove-Item -LiteralPath $blindRoot -Recurse -Force -ErrorAction SilentlyContinue }
 Assert ($anonManifest -notmatch 'checksum') 'No checksum line without a digest'
 
 # --- token shape -------------------------------------------------------------
@@ -301,6 +352,17 @@ function Get-TranscriptOf {
     try { & $Body } finally { Stop-Transcript | Out-Null }
     return (Get-Content -LiteralPath $file -Raw)
 }
+function Remove-StubState {
+    if ($script:stubRoot) { Remove-Item -Recurse -Force $script:stubRoot -ErrorAction SilentlyContinue }
+    Remove-Item Env:HFD_STUB_CODE, Env:HFD_STUB_PARTIAL, Env:HFD_STUB_LOG -ErrorAction SilentlyContinue
+}
+trap { Remove-StubState; break }
+# Stand in for the redirect walk so the transfer tests stay offline. The resolver's own
+# behaviour is covered by the manifest assertions above.
+function Resolve-HFDownload {
+    param([string]$Url, [string]$Token)
+    return [pscustomobject]@{ Url = $Url; SendToken = [bool]$Token; MaxRedirect = 0 }
+}
 $smallItems = @(
     [pscustomobject]@{ Url = 'https://huggingface.co/a/b/resolve/main/one.json'; Out = 'one.json'; Size = 4096 },
     [pscustomobject]@{ Url = 'https://huggingface.co/a/b/resolve/main/two.json'; Out = 'two.json'; Size = 8192 }
@@ -372,8 +434,10 @@ $mixed = @([pscustomobject]@{ Url = 'https://huggingface.co/a/b/resolve/main/big
 $destC = Join-Path $stubRoot 'c'
 $textC = Get-TranscriptOf { Invoke-Aria2Download -Aria2 $stubAria -Items $mixed -DestDir $destC -Token '' }
 Assert ($textC -match 'FAILED') 'Solo failure reported'
-Remove-Item -Recurse -Force $stubRoot -ErrorAction SilentlyContinue
-Remove-Item Env:HFD_STUB_CODE, Env:HFD_STUB_PARTIAL -ErrorAction SilentlyContinue
+# Cleanup belongs in a finally: an assertion failing anywhere above used to leave the
+# stub folder in %TEMP% and HFD_STUB_* set in the developer's session, so the next run
+# behaved differently for reasons nothing on screen explained.
+Remove-StubState
 
 Write-Host "PASS: $script:checks checks; no downloads started."
 
