@@ -14,6 +14,7 @@
     "start": "electron .",
     "test": "node --test tests/*.test.cjs",
     "test:terminal": "powershell -NoProfile -ExecutionPolicy Bypass -File tests/run-tests.ps1",
+    "icon": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/icon.ps1",
     "qa": "node tests/ui-static.cjs",
     "qa:electron": "node tests/ui-qa.cjs",
     "package": "electron-builder --win nsis --x64"
@@ -27,9 +28,9 @@
     "appId": "tools.huggingfacedownloader.desktop",
     "productName": "Hugging Face Downloader",
     "directories": { "output": "release" },
-    "files": ["desktop/**/*", "package.json"],
+    "files": ["desktop/**/*", "package.json", "assets/icon.png"],
     "extraResources": [{ "from": ".", "to": "terminal", "filter": ["hf-download.ps1", "HF Download.cmd"] }],
-    "win": { "target": "nsis", "signExecutable": false },
+    "win": { "target": "nsis", "icon": "assets/icon.ico", "signExecutable": false },
     "nsis": { "oneClick": false, "perMachine": false, "allowToChangeInstallationDirectory": true, "createDesktopShortcut": true, "createStartMenuShortcut": true, "artifactName": "Hugging-Face-Downloader-Setup-${version}.${ext}" }
   }
 }

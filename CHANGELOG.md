@@ -112,6 +112,17 @@ terminal script — are covered; where a fix applies to only one, it says so.
   from a UNC path, where `cd /d` silently fails and it reported missing dependencies
   on a fully installed copy.
 
+### Added
+
+- **An application icon.** The build previously logged "default Electron icon is
+  used", so the installer, the shortcuts and the taskbar button all showed
+  Electron's own logo. `scripts/icon.ps1` draws an arrow descending into a tray at
+  seven sizes (16 through 256) and packs them into `assets/icon.ico`; below 24
+  pixels it drops the tray and draws the arrow alone, because at that size the two
+  merge into a smudge. The glyph is original and uses the app's own colours — it
+  deliberately does not reproduce Hugging Face's logo or wordmark, which would sit
+  badly beside the disclaimer this README opens with. Regenerate with `npm run icon`.
+
 ### Changed
 
 - The `repository` field now names `M007-Net/hugging-face-downloader`, so the

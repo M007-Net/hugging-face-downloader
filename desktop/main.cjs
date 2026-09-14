@@ -86,7 +86,15 @@ if (primaryInstance) app.whenReady().then(() => {
   engine.job = wellFormed ? saved : null;
   if (engine.job && engine.job.status !== 'complete') { engine.job.status = 'paused'; engine.job.files.forEach(f => { if (f && f.status !== 'complete') f.status = 'waiting'; }); }
   const uiFile = path.join(__dirname,'index.html');
+  // The .ico in build.win covers the installed executable and its shortcuts; this
+  // covers the window and the taskbar button while the app is actually running, which
+  // would otherwise show Electron's default. Missing in development is harmless.
+  // Resolved from __dirname, not from `root`: build.files packs assets/ inside
+  // app.asar, whereas `root` is the resources directory beside it, so joining from
+  // there finds nothing once the app is packaged - and the guard below would hide it.
+  const windowIcon = path.join(__dirname, '..', 'assets', 'icon.png');
   window = new BrowserWindow({ width:1360, height:950, minWidth:1000, minHeight:720, backgroundColor:'#101416', title:'Hugging Face Downloader', autoHideMenuBar:true, show:false,
+    ...(fs.existsSync(windowIcon) ? { icon: windowIcon } : {}),
     webPreferences:{ preload:path.join(__dirname,'preload.cjs'), contextIsolation:true, nodeIntegration:false, sandbox:true } });
   window.webContents.setWindowOpenHandler(() => ({ action:'deny' }));
   window.webContents.on('will-navigate', (event, url) => { if (url !== pathToFileURL(uiFile).href) event.preventDefault(); });
