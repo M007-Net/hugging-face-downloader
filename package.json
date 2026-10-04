@@ -22,7 +22,7 @@
     "package": "electron-builder --win nsis --x64"
   },
   "devDependencies": {
-    "electron": "44.4.1",
+    "electron": "44.5.1",
     "electron-builder": "26.15.3",
     "playwright": "^1.55.0"
   },
