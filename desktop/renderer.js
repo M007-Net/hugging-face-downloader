@@ -3,11 +3,12 @@ const state = { page:'new', status:null, catalog:null, link:'', loading:false, m
 const $ = id => document.getElementById(id);
 const esc = value => String(value ?? '').replace(/[&<>"']/g,c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const size = value => { if (!(Number(value) > 0)) return 'Unknown'; const n = Math.min(4, Math.floor(Math.log(value)/Math.log(1024))); return `${(value/1024**n).toFixed(n > 1 ? 2 : 0)} ${['B','KB','MB','GB','TB'][n]}`; };
-const active = () => ['starting','downloading'].includes(state.job?.status);
+const active = () => ['starting','downloading','verifying'].includes(state.job?.status);
 const option = (value,text,current) => `<option value="${esc(value)}" ${value === current ? 'selected' : ''}>${esc(text)}</option>`;
 const explanations = {
   repo:['Start with a repository','A repository is the model’s folder on Hugging Face. Paste its link here and we’ll show the available files—nothing downloads yet.','Private or gated model? Add your read token in Settings.'],
   quant:['Find the right size','Quantization makes a model smaller. Lower bit levels usually use less memory, with a possible quality trade-off.','Start with a bit level, then choose an exact variant. The size shown is the download size, not the total memory needed to run it.'],
+  files:['Pick the files you need','This repository has no GGUF builds, so there is no quantization to choose. What is listed is the model as published — the weights plus small config and tokenizer files.','Everything is selected to start with. Clear what you do not want; the total above updates as you go.'],
   companions:['Only the extras you need','Vision projectors add image support. MTP files can help compatible runtimes predict multiple tokens at a time.','These are optional, filename-detected candidates. Match them to the model and your runtime. Some models already include MTP.'],
   destination:['Keep your library organized','Each download gets an owner/repository folder. Split files and companion folders keep their original layout.','Choose your own location or the standard LM Studio folder. Your choice is remembered on this computer.'],
   downloads:['Pause now. Resume later.','Pause affects only downloads started in this desktop app. Partial files stay on disk and are reused when you resume.','You can also close the app after pausing. The last queue will be waiting when you open it again.'],
@@ -23,11 +24,23 @@ function chosen() {
   const extra = ['vision','mtp'].flatMap(k => state.catalog[k].find(b => b.name === state[k])?.files || []);
   return [...new Map([...files,...extra].map(f => [f.path,f])).values()];
 }
+const hasGguf = c => c.files.some(f=>/[.]gguf$/i.test(f.path));
+const hasQuant = c => c.bundles.some(b=>b.quant);
 function resetQuant() {
   const list = state.catalog.bundles.filter(b=>b.quant);
   const first = list.find(b=>b.quant===state.status.settings.quant) || list.find(b=>b.bits===4) || list[0];
   state.bit = first?.bits || 0; state.quant=first?.quant || ''; state.model=first?.name || '';
-  state.mode=state.catalog.info.isFile || !list.length?'manual':'quant'; state.manual = new Set(state.catalog.info.isFile ? state.catalog.files.map(f=>f.path):[]);
+  // Manual selection is forced either by a direct file link or by a repository with
+  // nothing quantizable in it, and both deserve a starting selection. A file link
+  // means exactly that file. A repository with no GGUF at all is the model as
+  // published, where the weights and the small config and tokenizer files are
+  // wanted together. A repository that does have GGUF files but no readable
+  // quantization in their names is left unselected on purpose: choosing between
+  // builds is the whole point there, and taking every one could be hundreds of
+  // gigabytes nobody asked for.
+  const forced = state.catalog.info.isFile || !list.length;
+  state.mode = forced?'manual':'quant';
+  state.manual = new Set(state.catalog.info.isFile || (forced && !hasGguf(state.catalog)) ? state.catalog.files.map(f=>f.path):[]);
   state.vision='';state.mtp=''; state.search='';
 }
 // Shown on every page once a newer release is found. Downloading is one click
@@ -81,16 +94,23 @@ function newPage() {
   return `<div class="heading"><div class="eyebrow">NEW DOWNLOAD</div><h1>Download a model from Hugging Face</h1><p>Review the repository files before anything is written to disk.</p></div><div class="layout"><div class="flow">
   <section class="card" data-help="repo"><div class="section-title"><h2><span class="step">1</span> Find your model</h2><span class="caption">Hugging Face</span></div><form id="repo-form"><label for="repo">Model link or repository name</label><div class="row field-note"><input id="repo" placeholder="huggingface.co/owner/model-GGUF" value="${esc(state.link)}" ${active()?'disabled':''}><button class="primary" type="submit" ${state.loading||active()?'disabled':''}>${state.loading?'Loading…':'Load model'}</button></div></form>${c?`<div class="repo-name">✓ ${esc(c.info.repo)} <span class="caption"> · ${esc(c.info.rev)} · ${c.files.length} files</span></div>${c.skipped?`<div class="hint">${c.skipped} file${c.skipped===1?'':'s'} in this repository cannot be saved with a Windows-safe name and ${c.skipped===1?'was':'were'} left out.</div>`:''}`:'<div class="hint">Repository links, folder links, and direct file links all work.</div>'}</section>
   ${active()?'<div class="busy-note">A download is running. Visit Downloads to follow its progress.</div>':''}
-  ${c?`<section class="card" data-help="quant"><div class="section-title"><h2><span class="step">2</span> Choose what to download</h2></div><div class="segmented" role="group" aria-label="Selection mode"><button data-mode="quant" aria-pressed="${state.mode==='quant'}" class="${state.mode==='quant'?'selected':''}" ${!c.bundles.some(b=>b.quant)?'disabled':''}>Choose quantization</button><button data-mode="manual" aria-pressed="${state.mode==='manual'}" class="${state.mode==='manual'?'selected':''}">Choose specific files</button></div>${state.mode==='quant'?quantFields():manualFields()}</section>
-  <section class="card" data-help="companions"><div class="section-title"><h2><span class="step">3</span> Optional companions</h2><span class="caption">Your choice</span></div>${companion('vision','Vision / images','Adds image support when your runtime supports this model.')}${companion('mtp','MTP / faster generation','Optional prediction helper for compatible runtimes.')}</section>
-  <section class="card" data-help="destination"><div class="section-title"><h2><span class="step">4</span> Choose a home</h2></div><label>Download folder<input id="output" value="${esc(state.status.settings.outputDir)}" readonly></label><div class="links-row"><button id="browse" class="subtle">Browse folders</button><button id="lm" class="subtle">Use LM Studio folder</button></div><div class="hint">Files stay organized under ${esc(c.info.repo)}.</div></section>
+  ${c?`<section class="card" data-help="${hasQuant(c)?'quant':'files'}"><div class="section-title"><h2><span class="step">2</span> Choose what to download</h2></div><div class="segmented" role="group" aria-label="Selection mode"><button data-mode="quant" aria-pressed="${state.mode==='quant'}" class="${state.mode==='quant'?'selected':''}" ${!hasQuant(c)?'disabled':''}>Choose quantization</button><button data-mode="manual" aria-pressed="${state.mode==='manual'}" class="${state.mode==='manual'?'selected':''}">Choose specific files</button></div>${hasQuant(c)?'':noQuantNote(c)}${state.mode==='quant'?quantFields():manualFields()}</section>
+  ${hasGguf(c)?`<section class="card" data-help="companions"><div class="section-title"><h2><span class="step">3</span> Optional companions</h2><span class="caption">Your choice</span></div>${companion('vision','Vision / images','Adds image support when your runtime supports this model.')}${companion('mtp','MTP / faster generation','Optional prediction helper for compatible runtimes.')}</section>`:''}
+  <section class="card" data-help="destination"><div class="section-title"><h2><span class="step">${hasGguf(c)?4:3}</span> Choose a home</h2></div><label>Download folder<input id="output" value="${esc(state.status.settings.outputDir)}" readonly></label><div class="links-row"><button id="browse" class="subtle">Browse folders</button><button id="lm" class="subtle">Use LM Studio folder</button></div><div class="hint">Files stay organized under ${esc(c.info.repo)}.</div></section>
   <section class="review"><div class="review-top"><div><strong>${size(total)}</strong><small>${selected.length} file${selected.length===1?'':'s'} selected · review below</small></div><button id="download" class="primary" ${!selected.length||active()||(!validSelection())?'disabled':''}>Download selected</button></div><details><summary>Review selected files</summary><div class="file-list">${selected.map(f=>`<div class="file-row"><span class="filename">${esc(f.path)}</span><span class="size">${size(f.size)}</span></div>`).join('')}</div></details></section>`:
   '<section class="empty"><div class="empty-symbol">↓</div><h2>No repository loaded</h2><p>Paste a Hugging Face repository, folder, or file link to inspect it.</p><div class="empty-steps"><span>Choose files</span><span>Review</span><span>Download</span></div></section>'}
-  </div>${help(c?'quant':'repo')}</div>`;
+  </div>${help(c?(hasQuant(c)?'quant':'files'):'repo')}</div>`;
 }
 function validSelection() {
   if (state.mode==='quant' && !state.catalog?.bundles.find(b=>b.name===state.model)?.complete) return false;
   return ['vision','mtp'].every(k=>!state[k] || state.catalog[k].find(b=>b.name===state[k])?.complete);
+}
+// Without this the disabled button is the only signal: the repository loaded, every
+// file is listed, and nothing says that the thing this app is mostly for does not
+// apply here. That reads as an app which failed to fetch the model.
+function noQuantNote(c) {
+  if (hasGguf(c)) return `<p class="radio-caption">No quantization could be read from the GGUF filenames in this repository. Choose the files you want below.</p>`;
+  return `<p class="radio-caption">This repository has no GGUF files, so there is nothing to quantize — these are the model weights as published. Every file is selected below; clear anything you do not need. Where a GGUF build exists for LM Studio or llama.cpp, it is usually the same name with <b>-GGUF</b> on the end: <b>${esc(c.info.repo)}-GGUF</b>.</p>`;
 }
 function quantFields() {
   const list=state.catalog.bundles.filter(b=>b.quant); const levels=[...new Set(list.map(b=>b.bits))].sort((a,b)=>a-b); const quants=[...new Set(list.filter(b=>b.bits===state.bit).map(b=>b.quant))].sort(); const models=list.filter(b=>b.quant===state.quant); const b=models.find(b=>b.name===state.model);
@@ -104,7 +124,8 @@ function companion(key,title,explanation) {
 }
 function downloadsPage() {
   const j=state.job; const total=j?.files.reduce((n,f)=>n+f.size,0)||0; const done=j?.files.reduce((n,f)=>n+f.completed,0)||0; const speed=j?.files.reduce((n,f)=>n+f.speed,0)||0; const pct=total?Math.min(100,done/total*100):null; // null = no sizes reported, so a percentage would be a lie
-  return `<div class="heading"><div class="eyebrow">DOWNLOADS</div><h1>${j?.status==='complete'?'Download complete':'Downloads'}</h1><p>Pause or resume downloads started by this app.</p></div><div class="layout"><div class="flow">${j?`<div class="stats"><div class="stat"><span>Progress</span><strong>${pct===null?size(done)+" downloaded":pct.toFixed(1)+"%"}</strong></div><div class="stat"><span>Download speed</span><strong>${size(speed)}/s</strong></div><div class="stat"><span>Completed files</span><strong>${j.files.filter(f=>f.status==='complete').length} / ${j.files.length}</strong></div></div><section class="card"><div class="section-title"><h2>${esc(j.info.repo)}</h2><span class="transfer-status">${esc(j.status)}</span></div>${j.error?`<div class="error">${esc(j.error)}</div>`:''}<div class="progress-track"><progress max="100" value="${pct}" aria-label="Overall download progress"></progress></div><small>${size(done)} of ${size(total)}</small><div class="links-row">${active()?'<button id="pause">Pause download</button>':j.status!=='complete'?'<button class="primary" id="resume">Resume / retry</button>':''}<button id="open-folder">Open download folder</button></div><p class="mono">${esc(j.destination)}</p>${j.files.map(f=>`<div class="transfer-file"><div class="row"><span>${esc(f.path)}</span><span class="transfer-status${f.status==='error'?' failed':''}">${esc(f.status)}</span></div><small>${size(f.completed)} / ${size(f.size)}${f.speed?' · '+size(f.speed)+'/s':''}</small>${f.error?`<small class="failed">${esc(f.error)}</small>`:''}</div>`).join('')}</section>`:'<section class="empty"><div class="empty-symbol">↓</div><h2>No downloads yet</h2><p>Start with a model link. You can review every file before downloading.</p><button class="primary field-gap" data-page="new">Find a model</button></section>'}</div>${help('downloads')}</div>`;
+  const label=status=>status==='verifying'?'Checking downloaded files':status==='downloaded'?'Downloaded · awaiting check':status;
+  return `<div class="heading"><div class="eyebrow">DOWNLOADS</div><h1>${j?.status==='complete'?'Download complete':'Downloads'}</h1><p>Pause or resume downloads started by this app.</p></div><div class="layout"><div class="flow">${j?`<div class="stats"><div class="stat"><span>Progress</span><strong>${pct===null?size(done)+" downloaded":pct.toFixed(1)+"%"}</strong></div><div class="stat"><span>Download speed</span><strong>${speed?size(speed)+'/s':'0 B/s'}</strong></div><div class="stat"><span>Completed files</span><strong>${j.files.filter(f=>f.status==='complete').length} / ${j.files.length}</strong></div></div><section class="card"><div class="section-title"><h2>${esc(j.info.repo)}</h2><span class="transfer-status">${esc(label(j.status))}</span></div>${j.error?`<div class="error">${esc(j.error)}</div>`:''}<div class="progress-track"><progress max="100" value="${pct}" aria-label="Overall download progress"></progress></div><small>${size(done)} of ${size(total)}</small><div class="links-row">${active()?'<button id="pause">Pause download</button>':j.status!=='complete'?'<button class="primary" id="resume">Resume / retry</button>':''}<button id="open-folder">Open download folder</button></div><p class="mono">${esc(j.destination)}</p>${j.files.map(f=>`<div class="transfer-file"><div class="row"><span>${esc(f.path)}</span><span class="transfer-status${f.status==='error'?' failed':''}">${esc(label(f.status))}</span></div><small>${size(f.completed)} / ${size(f.size)}${f.speed?' · '+size(f.speed)+'/s':''}</small>${f.error?`<small class="failed">${esc(f.error)}</small>`:''}</div>`).join('')}</section>`:'<section class="empty"><div class="empty-symbol">↓</div><h2>No downloads yet</h2><p>Start with a model link. You can review every file before downloading.</p><button class="primary field-gap" data-page="new">Find a model</button></section>'}</div>${help('downloads')}</div>`;
 }
 function updateSettings() {
   const u=state.update;
@@ -159,7 +180,7 @@ document.addEventListener('click',e=>{const t=e.target.closest('button');if(!t)r
   // had in fact started correctly.
   if(t.id==='download'){t.disabled=true;if(state.remember&&state.mode==='quant')state.status=await api.saveSettings({quant:state.quant});state.job=await api.start(chosen().map(f=>f.path));state.page='downloads';render();}
   if(t.id==='pause'){t.disabled=true;t.textContent='Pausing…';state.job=await api.pause();render();}
-  if(t.id==='resume'){state.job=await api.resume();render();}
+  if(t.id==='resume'){t.disabled=true;state.job=await api.resume();render();}
   if(t.id==='open-folder')await api.openFolder();
   if(t.id==='update-check'){state.dismissed=false;state.update=await api.checkUpdate();render();}
   if(t.id==='update-download'){t.disabled=true;state.update=await api.downloadUpdate();render();}

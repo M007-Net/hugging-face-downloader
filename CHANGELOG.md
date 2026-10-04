@@ -6,6 +6,42 @@ uses [semantic versioning](https://semver.org/spec/v2.0.0.html).
 
 Dates are the date the version was prepared.
 
+## Unreleased
+
+### Fixed
+
+- Pausing during download URL preparation now cancels the pending request and
+  prevents aria2 from launching after the pause. Pausing during SHA-256 checking
+  stops the read and preserves staged files for resume.
+- Resume recovers the newest valid aria2 control save, including temporary saves
+  left beside an older canonical file. Successful transfers remove leftover
+  control saves so completed files are not downloaded again after a pause.
+- Desktop retry moves files that fail verification to a `.failed-` name and
+  fetches fresh bytes. Previously it could check the same corrupt file forever.
+- Long-running desktop downloads retain their destination lock after 24 hours.
+  Errors saving the queue no longer prevent progress from reaching the window.
+- Desktop progress uses aria2's live output or saved piece accounting rather
+  than sparse file length. The full queue downloads before SHA-256 checking,
+  which is shown as **Checking downloaded files**.
+- Both engines resolve Hugging Face redirects before invoking aria2 and never
+  pass it bearer tokens or unsupported redirect-limit options. Direct private
+  responses without a signed download URL fail with an explanation.
+- Terminal SHA-256 checking uses a streaming .NET implementation so it works
+  when Windows PowerShell cannot resolve the Get-FileHash function.
+- Installing development dependencies fetches the Electron runtime unless
+  ELECTRON_SKIP_BINARY_DOWNLOAD is set.
+- Repositories without GGUF builds explain the available file choices and
+  select the published files. Download and resume buttons disable on click.
+
+### Changed
+
+- Local folders, mapped drives, and explicit UNC shares are accepted as download
+  destinations. UNC free-space checks use the Windows disk-space API.
+- Electron updated from 44.3.0 to 44.4.1.
+- Added pause, verification, corrupt-file retry, and control-save regressions,
+  plus an optional real aria2 test using a throttled loopback fixture. It pauses
+  twice, restores the saved queue, checks byte-range resume, and verifies hashes.
+
 ## 0.3.0 — 2026-09-14
 
 First version prepared for public release. Both engines — the desktop app and the

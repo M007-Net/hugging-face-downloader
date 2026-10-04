@@ -65,9 +65,8 @@ function Enable-IPv4Only {
     }
 }
 
-# A token travels to aria2 as a header line on stdin. A control character in it
-# would end that line early and let whatever followed be read as another option,
-# so anything that cannot appear in a real token is refused rather than escaped.
+# A token is sent only in HTTPS metadata/redirect requests to huggingface.co.
+# Refuse control characters rather than allowing malformed request headers.
 function Assert-ValidToken {
     param([string]$Value)
     if ($Value -match '[\x00-\x1F\x7F]' -or $Value.Length -gt 4096) {
@@ -160,19 +159,53 @@ function Invoke-HFApiRequest {
 
 function Get-FileSha256 {
     param([string]$Path)
-    return (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLowerInvariant()
+    $stream = [IO.File]::OpenRead($Path)
+    $hash = [Security.Cryptography.SHA256]::Create()
+    try { return ([BitConverter]::ToString($hash.ComputeHash($stream))).Replace('-', '').ToLowerInvariant() }
+    finally { $hash.Dispose(); $stream.Dispose() }
 }
 
 # Running out of disk half way through a 40 GB model wastes the whole transfer,
 # and aria2 reports it as an ordinary write failure. Check up front instead.
 # Unknown free space is not a reason to refuse - only a known shortfall is.
+function Get-AvailableFreeSpace {
+    param([string]$Path)
+    $root = [IO.Path]::GetPathRoot([IO.Path]::GetFullPath($Path))
+    if ($root -match '^\\\\') {
+        # DriveInfo accepts drive letters, but rejects UNC roots. Windows' disk
+        # space API accepts both local paths and \\server\share paths.
+        if (-not ('HfDownloader.DiskSpace' -as [type])) {
+            Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+namespace HfDownloader {
+    public static class DiskSpace {
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool GetDiskFreeSpaceEx(string directoryName,
+            out ulong freeBytesAvailable, out ulong totalNumberOfBytes,
+            out ulong totalNumberOfFreeBytes);
+
+        public static ulong? Available(string path) {
+            ulong available, total, free;
+            return GetDiskFreeSpaceEx(path, out available, out total, out free)
+                ? (ulong?)available : null;
+        }
+    }
+}
+'@ | Out-Null
+        }
+        return [HfDownloader.DiskSpace]::Available($Path)
+    }
+    return (New-Object IO.DriveInfo $root).AvailableFreeSpace
+}
+
 function Assert-FreeSpace {
     param([string]$DestDir, [int64]$Needed)
     if ($Needed -le 0) { return }
     $free = $null
     try {
-        $root = [IO.Path]::GetPathRoot([IO.Path]::GetFullPath($DestDir))
-        $free = (New-Object IO.DriveInfo $root).AvailableFreeSpace
+        $free = Get-AvailableFreeSpace -Path $DestDir
     } catch { return }
     if ($null -eq $free) { return }
     $headroom = $Needed + [int64]($Needed * 0.05)
@@ -569,18 +602,15 @@ function Get-RemoteFileInfo {
     # redirect or an error is the length of that response's own body, not the
     # file. Follow through to the final 200 and only trust the length there.
     #
-    # The follow-through used to be -MaximumRedirection 10 with $h still attached.
-    # Windows PowerShell 5.1 does not strip a hand-set Authorization header across a
-    # redirect, so that handed the bearer token to whichever CDN host answered - the
-    # exact thing Invoke-HFApiRequest exists to prevent. Resolve-HFDownload walks the
-    # chain properly and drops the credential the moment it leaves huggingface.co.
+    # Resolve-HFDownload walks the chain and ensures every URL returned to this
+    # unauthenticated size probe is public or a signed CDN URL.
     if ($null -eq $size) {
         try {
             $resolved = Resolve-HFDownload -Url $Url -Token $Token
             $final = @{ 'User-Agent' = 'hf-download-ps/1.0' }
-            if ($resolved.SendToken -and $Token) { $final['Authorization'] = "Bearer $Token" }
+            $redirectLimit = if (([uri]$resolved.Url).Host -eq 'huggingface.co') { 0 } else { 10 }
             $r = Invoke-WebRequest -Uri $resolved.Url -Method Head -Headers $final -UseBasicParsing `
-                                   -MaximumRedirection $resolved.MaxRedirect -TimeoutSec 20 -ErrorAction Stop
+                                   -MaximumRedirection $redirectLimit -TimeoutSec 20 -ErrorAction Stop
             if ((Get-ResponseStatus $r) -eq 200) {
                 $length = Get-ResponseHeader $r 'Content-Length'
                 if ($length) { $size = [int64]$length }
@@ -866,19 +896,32 @@ function Resolve-HFDownload {
     if ($Token) { $headers['Authorization'] = 'Bearer ' + $Token }
     $current = Assert-HFUrl $Url
     for ($hop = 0; $hop -le 10; $hop++) {
+        $response = $null
         try {
-            $null = Invoke-WebRequest -Uri $current -Method Head -Headers $headers -UseBasicParsing `
-                                      -MaximumRedirection 0 -TimeoutSec 30 -ErrorAction Stop
-            # Served straight from huggingface.co. aria2 may carry the header, but only
-            # because redirects are switched off for this item so it cannot be forwarded.
-            return [pscustomobject]@{ Url = $current; SendToken = [bool]$Token; MaxRedirect = 0 }
-        } catch {
-            $response = $_.Exception.Response
-            if (-not $response) { throw }
+            $response = Invoke-HFHeadRequest -Url $current -Headers $headers -TimeoutSec 30
             $status = Get-ResponseStatus $response
-            if ($status -lt 300 -or $status -gt 399) {
-                throw (Get-HFAccessMessage $status)
+            if ($status -eq 200) {
+                # aria2 has no redirect limit option, and it replays custom headers
+                # across redirects. Verify this direct response is public before giving
+                # its URL to aria2, so a bearer header is never sent by the downloader.
+                if ($Token) {
+                    $anonymous = $null
+                    try {
+                        try {
+                            $anonymous = Invoke-HFHeadRequest -Url $current -Headers @{ 'User-Agent' = 'hf-download-ps/1.0' } -TimeoutSec 30
+                        } catch {
+                            throw ('Could not verify anonymous access to this direct response: {0}' -f $_.Exception.Message)
+                        }
+                        if ((Get-ResponseStatus $anonymous) -ne 200) {
+                            throw 'This file requires Hugging Face authentication and cannot be downloaded safely by aria2.'
+                        }
+                    } finally {
+                        if ($anonymous -is [IDisposable]) { $anonymous.Dispose() }
+                    }
+                }
+                return [pscustomobject]@{ Url = $current; SendToken = $false }
             }
+            if ($status -lt 300 -or $status -gt 399) { throw (Get-HFAccessMessage $status) }
             $location = Get-ResponseHeader $response 'Location'
             if (-not $location) { throw 'Hugging Face returned an incomplete download redirect.' }
             $next = [uri]::new([uri]$current, [string]$location)
@@ -886,44 +929,63 @@ function Resolve-HFDownload {
             if ($next.Host -ne 'huggingface.co') {
                 # Left the origin: signed URL, no credential, and aria2 may follow the
                 # rest of the chain on its own because there is nothing left to leak.
-                return [pscustomobject]@{ Url = $next.AbsoluteUri; SendToken = $false; MaxRedirect = 10 }
+                return [pscustomobject]@{ Url = $next.AbsoluteUri; SendToken = $false }
             }
             $current = $next.AbsoluteUri
+        } finally {
+            if ($response -is [IDisposable]) { $response.Dispose() }
         }
     }
     throw 'Hugging Face redirected the download too many times.'
 }
 
-# Every download goes through a manifest on aria2's stdin, including single ones.
-# A --header argument would put the bearer token on the command line, where any
-# other process on the machine can read it for as long as the transfer runs, and
-# a temp file would leave it on disk if the script were killed mid-download.
+# Invoke-WebRequest -MaximumRedirection 0 is unreliable in Windows PowerShell 5.1:
+# on some 302 responses it throws InvalidOperationException without attaching the
+# HTTP response. HttpWebRequest exposes the response directly and lets us disable
+# automatic redirects before the authenticated HEAD request leaves the process.
+function Invoke-HFHeadRequest {
+    param([string]$Url, [hashtable]$Headers, [int]$TimeoutSec = 30)
+    $request = [Net.HttpWebRequest][Net.WebRequest]::Create($Url)
+    $request.Method = 'HEAD'
+    $request.AllowAutoRedirect = $false
+    $request.Timeout = $TimeoutSec * 1000
+    $request.ReadWriteTimeout = $TimeoutSec * 1000
+    foreach ($name in $Headers.Keys) {
+        if ($name -eq 'User-Agent') { $request.UserAgent = [string]$Headers[$name] }
+        else { $request.Headers[[string]$name] = [string]$Headers[$name] }
+    }
+    try { return $request.GetResponse() }
+    catch [Net.WebException] {
+        if ($_.Exception.Response) { return $_.Exception.Response }
+        throw
+    }
+}
+
+# Every aria2 download goes through a manifest on stdin, including single ones.
+# Bearer tokens are never included: aria2 has no redirect cap and replays custom
+# headers to redirect targets. Resolve-HFDownload only returns URLs that need no token.
 function New-Aria2Manifest {
     param([array]$Items, [string]$Token)
     $lines = New-Object System.Collections.Generic.List[string]
     foreach ($item in $Items) {
-        # Resolve-HFDownload has already walked the redirect chain, so this is either a
-        # signed CDN URL (no credential, aria2 may follow the rest) or a huggingface.co
-        # URL that answered directly. A token is emitted only in the second case, and
-        # always beside max-redirect=0 so aria2 cannot forward it anywhere.
+        # Resolve-HFDownload has already walked the Hugging Face redirect chain.
+        # Authenticated direct responses are rejected there because aria2 cannot
+        # safely carry a custom header across redirects.
         $url = $item.Url
-        $sendToken = $true
-        $maxRedirect = 0
+        $sendToken = $false
         if ($item.PSObject.Properties['Resolved'] -and $item.Resolved) {
             $url         = $item.Resolved.Url
             $sendToken   = [bool]$item.Resolved.SendToken
-            $maxRedirect = [int]$item.Resolved.MaxRedirect
         }
+        if ($sendToken) { throw 'Refusing to put a Hugging Face bearer token in an aria2 manifest.' }
         $lines.Add($url)
         # Write to .part and rename only after the bytes check out, so an
         # interrupted transfer never leaves something at the real name that
         # later looks finished.
         $lines.Add('  out=' + $item.Out + '.part')
-        $lines.Add('  max-redirect=' + $maxRedirect)
         if ($item.PSObject.Properties['Sha256'] -and $item.Sha256) {
             $lines.Add('  checksum=sha-256=' + $item.Sha256)
         }
-        if ($Token -and $sendToken) { $lines.Add('  header=Authorization: Bearer ' + $Token) }
     }
     return (($lines -join "`n") + "`n")
 }

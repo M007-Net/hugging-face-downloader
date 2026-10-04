@@ -107,7 +107,35 @@ test('resolves authenticated redirects without forwarding the token to a CDN',as
   });
   assert.equal(prepared.url,'https://cdn.example/signed');
   assert.deepEqual(prepared.headers,[]);
-  assert.equal(prepared.maxRedirect,10);
   assert.equal(seen[0].auth,'Bearer secret');
   assert.equal(seen[0].redirect,'manual');
+});
+test('a direct Hugging Face response is downloaded without forwarding a token',async()=>{
+  const seen=[];
+  const prepared=await core.resolveDownload(core.parseLink('owner/repo'),'model.gguf','secret',async(url,options)=>{
+    seen.push({url:String(url),auth:options.headers.Authorization,redirect:options.redirect});
+    return {status:200,ok:true,headers:new Headers()};
+  });
+  assert.equal(prepared.url,'https://huggingface.co/owner/repo/resolve/main/model.gguf?download=true');
+  assert.deepEqual(prepared.headers,[]);
+  assert.deepEqual(seen.map(request=>request.auth),['Bearer secret',undefined]);
+  assert.ok(seen.every(request=>request.redirect==='manual'));
+});
+test('a private direct Hugging Face response fails safely instead of passing the token to aria2',async()=>{
+  const seen=[];
+  await assert.rejects(core.resolveDownload(core.parseLink('owner/repo'),'model.gguf','secret',async(url,options)=>{
+    seen.push({url:String(url),auth:options.headers.Authorization,redirect:options.redirect});
+    return seen.length===1 ? {status:200,ok:true,headers:new Headers()} : {status:403,ok:false,headers:new Headers()};
+  }),/cannot pass your token to aria2/);
+  assert.deepEqual(seen.map(request=>request.auth),['Bearer secret',undefined]);
+  assert.ok(seen.every(request=>request.url.startsWith('https://huggingface.co/')));
+});
+test('download URL preparation can be aborted while a HEAD request is pending', async () => {
+  const abort = new AbortController();
+  const fetcher = async (_url, options) => new Promise((_resolve, reject) => {
+    options.signal.addEventListener('abort', () => reject(new Error('request cancelled')), { once:true });
+  });
+  const pending = require('../desktop/core.cjs').resolveDownload({ repo:'owner/repo', kind:'models', rev:'main' }, 'model.gguf', '', fetcher, abort.signal);
+  abort.abort();
+  await assert.rejects(pending, /request cancelled/);
 });

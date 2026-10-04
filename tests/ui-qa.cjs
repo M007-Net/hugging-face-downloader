@@ -50,6 +50,40 @@ const fs = require('node:fs');
     await page.locator('#repo').fill('https://example.com/wrong');await page.getByRole('button',{name:'Load model',exact:true}).click();
     await page.getByRole('alert').filter({hasText:'Use a link from huggingface.co.'}).waitFor();
     assert.equal(await page.locator('#download').count(),0);
+    // A repository published as safetensors only. There is nothing to quantize, and
+    // the interface used to say so in the one way a user cannot read: a disabled
+    // button, an empty file list and a dead Download. Every part of the recovery is
+    // checked here, because each one on its own still leaves a dead end.
+    await page.locator('nav').getByRole('button',{name:'New download'}).click();
+    await page.locator('#repo').fill('unsloth/gemma-4-12b-it');await page.getByRole('button',{name:'Load model',exact:true}).click();
+    await page.getByText('no GGUF files',{exact:false}).waitFor();
+    assert.ok(await page.locator('[data-mode="quant"]').isDisabled(),'quantization cannot be offered here');
+    assert.equal(await page.locator('[data-mode="manual"]').getAttribute('aria-pressed'),'true','manual selection is what is left');
+    // The note has to name the way out, not just the problem.
+    assert.match(await page.locator('.radio-caption').first().innerText(),/unsloth[/]gemma-4-12b-it-GGUF/,'the note should name the GGUF repository to try');
+    // Nothing preselected is what made this look like a failed fetch.
+    assert.equal(await page.locator('[data-file]:checked').count(),9,'every file starts selected');
+    assert.ok(await page.locator('#download').isEnabled(),'Download must not be dead on arrival');
+    // Companions are GGUF-only, so here they could only ever read NOT FOUND.
+    assert.equal(await page.locator('[data-companion]').count(),0,'companion rows are not shown without GGUF');
+    await page.screenshot({path:path.join(output,'06-no-gguf.png'),fullPage:true});
+    // Exercise the real renderer and preload controls using an isolated queue.
+    // The actual transfer engine's pauses and saved-queue resumes are covered
+    // separately by test:aria2; this fixture never writes download files.
+    await app.evaluate(({ ipcMain, BrowserWindow }) => {
+      const queue = { info:{ repo:'fixture/model' }, destination:'D:\\AI\\models', status:'downloading', files:[{ path:'model.gguf', size:100, completed:25, speed:5, status:'downloading' }] };
+      ipcMain.removeHandler('pause-download');
+      ipcMain.removeHandler('resume-download');
+      ipcMain.handle('pause-download', async () => { queue.status='paused'; queue.files[0].status='paused'; queue.files[0].speed=0; return queue; });
+      ipcMain.handle('resume-download', async () => { queue.status='downloading'; queue.files[0].status='downloading'; return queue; });
+      BrowserWindow.getAllWindows()[0].webContents.send('download-progress', queue);
+    });
+    await page.locator('nav').getByRole('button',{name:'Downloads'}).click();
+    await page.getByRole('button',{name:'Pause download',exact:true}).click();
+    await page.getByRole('button',{name:'Resume / retry',exact:true}).waitFor();
+    await page.getByRole('button',{name:'Resume / retry',exact:true}).click();
+    await page.getByRole('button',{name:'Pause download',exact:true}).waitFor();
+    assert.ok(await page.getByText('25.0%',{exact:true}).isVisible(), 'resumed progress stays visible');
     await page.setViewportSize({width:1000,height:760});
     assert.ok(await page.evaluate(()=>document.documentElement.scrollWidth<=window.innerWidth),'No horizontal overflow at minimum width');
     assert.deepEqual(errors,[]);

@@ -23,9 +23,10 @@ paid on-call rotation, so please do not expect an immediate response.
 - A token is read from `HF_TOKEN`, `HUGGING_FACE_HUB_TOKEN`,
   `HUGGINGFACE_TOKEN`, or the Hugging Face CLI token cache. The tool does not
   store its own copy.
-- The token is sent to aria2 on **stdin**, never as a command-line argument and
-  never through a temporary file. Command lines are readable by any other
-  process on the machine; stdin is not.
+- The token is used only for the downloader's Hugging Face metadata and
+  redirect requests. It is never sent to aria2, stored in a transfer manifest,
+  or included on a command line. Private files served directly without a signed
+  download URL are refused rather than passing credentials to aria2.
 - The token is attached only to requests to `huggingface.co`. Hugging Face
   answers a download with a redirect to a CDN, and the redirect is followed
   deliberately, with the authorization header dropped, so the CDN receives only
@@ -43,7 +44,8 @@ paid on-call rotation, so please do not expect an immediate response.
   normalization — are skipped rather than silently overwriting one another.
 - Downloads are written to a `.part` file and renamed only after the size and,
   where Hugging Face publishes one, the SHA-256 match. An existing file is
-  reused only if it hashes to the expected digest.
+  reused only if it hashes to the expected digest. Files without a published
+  digest must match their known size; a file with neither cannot be verified.
 - A listing is pinned to the commit it came from (`x-repo-commit`), so a branch
   that moves mid-download cannot swap the bytes underneath you.
 - Metadata requests are pinned to IPv4 to match aria2's transfer settings.

@@ -198,19 +198,24 @@ async function listRepo(input, token = '', fetcher = fetchIPv4) {
   if (commit) info.commit = commit;
   return { ...catalog(info, files), allFiles: files, skipped };
 }
-async function resolveDownload(info, file, token = '', fetcher = fetchIPv4) {
+async function resolveDownload(info, file, token = '', fetcher = fetchIPv4, signal) {
   token = validToken(token);
   let current = new URL(downloadUrl(info, file));
+  const head = async headers => {
+    const abort = new AbortController();
+    const cancel = () => abort.abort();
+    if (signal?.aborted) cancel();
+    signal?.addEventListener('abort', cancel, { once:true });
+    const timeout = setTimeout(cancel, 30000);
+    try { return await fetcher(current, { method:'HEAD', redirect:'manual', headers, signal:abort.signal }); }
+    finally { clearTimeout(timeout); signal?.removeEventListener('abort', cancel); }
+  };
   for (let redirects = 0; redirects <= 10; redirects++) {
     if (current.protocol !== 'https:' || current.username || current.password) throw new Error('Hugging Face returned an unsafe download address.');
     // Once Hugging Face supplies a signed CDN URL, stop resolving. aria2 can
     // follow later redirects without ever receiving the bearer token.
-    if (current.origin !== HF_ORIGIN) return { url: current.toString(), headers: [], maxRedirect: 10 };
-    const response = await fetcher(current, {
-      method: 'HEAD', redirect: 'manual',
-      headers: { 'User-Agent': 'HuggingFaceDownloader/0.3', ...(token ? { Authorization: `Bearer ${token}` } : {}) },
-      signal: AbortSignal.timeout(30000)
-    });
+    if (current.origin !== HF_ORIGIN) return { url: current.toString(), headers: [] };
+    const response = await head({ 'User-Agent': 'HuggingFaceDownloader/0.3', ...(token ? { Authorization: `Bearer ${token}` } : {}) });
     if ([301, 302, 303, 307, 308].includes(response.status)) {
       if (redirects === 10) throw new Error('Hugging Face redirected the download too many times.');
       const location = response.headers.get('location');
@@ -219,10 +224,21 @@ async function resolveDownload(info, file, token = '', fetcher = fetchIPv4) {
       continue;
     }
     if (!response.ok) throw new Error(response.status === 401 || response.status === 403 ? 'Access denied. Check your Hugging Face token and model access.' : response.status === 404 ? 'File or revision not found. Reload the repository listing.' : `Hugging Face returned HTTP ${response.status} while preparing the download.`);
-    // Small private files can be served directly by huggingface.co. In that
-    // case aria2 gets the header, but redirects are disabled so it cannot be
-    // forwarded to another host.
-    return { url: current.toString(), headers: token ? [`Authorization: Bearer ${token}`] : [], maxRedirect: 0 };
+    // aria2 has no per-download redirect-disable option, and custom headers can
+    // be forwarded across redirects. If a token-bearing HEAD did not redirect,
+    // check whether the file is public without credentials. Never hand a token to
+    // aria2, even when the authenticated HEAD succeeded.
+    if (token) {
+      const publicResponse = await head({ 'User-Agent': 'HuggingFaceDownloader/0.3' });
+      if ([301, 302, 303, 307, 308].includes(publicResponse.status)) {
+        if (!publicResponse.headers.get('location')) throw new Error('Hugging Face returned an incomplete download redirect.');
+        current = new URL(publicResponse.headers.get('location'), current);
+        continue;
+      }
+      if ([401, 403].includes(publicResponse.status)) throw new Error('This private file is served directly without a signed download link. For safety, the desktop downloader cannot pass your token to aria2. Use a public repository or ask the model owner for a downloadable link.');
+      if (!publicResponse.ok) throw new Error(`Hugging Face returned HTTP ${publicResponse.status} while checking whether the file is public.`);
+    }
+    return { url: current.toString(), headers: [] };
   }
   throw new Error('Hugging Face redirected the download too many times.');
 }

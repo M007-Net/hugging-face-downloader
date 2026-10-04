@@ -29,17 +29,21 @@ const root = app.isPackaged ? process.resourcesPath : path.resolve(__dirname, '.
 const defaults = { outputDir: path.join(os.homedir(),'Downloads','HuggingFace'), quant:'', connections:16, disableIPv6:true, aria2Path:'' };
 function readJSON(file, fallback) { try { return JSON.parse(fs.readFileSync(file,'utf8').replace(/^\uFEFF/,'')); } catch { return fallback; } }
 function saveJSON(file, value) { fs.mkdirSync(path.dirname(file), { recursive:true }); fs.writeFileSync(file + '.tmp', JSON.stringify(value,null,2)); fs.renameSync(file + '.tmp',file); }
-// path.isAbsolute() alone says yes to "\\\\attacker.example\\share". Both mkdirSync and
-// aria2's --dir would then touch that remote share, and Windows attempts NTLM against it
-// without asking, handing the user's account name and a challenge response to whoever
-// runs it. A download folder is a local drive.
-function localDirectory(value) {
+// Accept local drives and explicit UNC shares as download destinations. Do not accept
+// device namespace paths (\\?\ and \\.\), malformed shares, or dot segments that could
+// escape the selected share. Mapped drive paths are covered by the local-drive form.
+function destinationDirectory(value) {
   if (typeof value !== 'string' || value.length > 4096) return false;
   if (/[\u0000-\u001f]/.test(value)) return false;
-  return /^[A-Za-z]:[\\/]/.test(value);
+  if (/^[A-Za-z]:[\\/]/.test(value)) return true;
+  const unc = value.replace(/\//g, '\\');
+  if (!unc.startsWith('\\\\') || unc.startsWith('\\\\?\\') || unc.startsWith('\\\\.\\')) return false;
+  const match = /^\\\\([^\\]+)\\([^\\]+)(?:\\|$)/.exec(unc);
+  if (!match || match[1] === '.' || match[1] === '..' || match[2] === '.' || match[2] === '..') return false;
+  return !unc.slice(match[0].length).split('\\').includes('..');
 }
 function cleanSettings(value = {}) {
-  const outputDir = typeof value.outputDir === 'string' && localDirectory(value.outputDir) ? value.outputDir : defaults.outputDir;
+  const outputDir = typeof value.outputDir === 'string' && destinationDirectory(value.outputDir) ? value.outputDir : defaults.outputDir;
   const connections = Number.isInteger(Number(value.connections)) && Number(value.connections) >= 1 && Number(value.connections) <= 16 ? Number(value.connections) : defaults.connections;
   return { outputDir, quant:typeof value.quant === 'string' ? value.quant.slice(0,128) : '', connections, disableIPv6:true, aria2Path:typeof value.aria2Path === 'string' ? value.aria2Path : '' };
 }
@@ -110,14 +114,21 @@ if (primaryInstance) app.whenReady().then(() => {
   });
   let lastSaved = 0;
   engine.on('update', job => {
-    if (Date.now() - lastSaved > 2000 || !engine.busy) { saveJSON(lastJobFile, job); lastSaved = Date.now(); }
+    if (Date.now() - lastSaved > 2000 || !engine.busy) {
+      try { saveJSON(lastJobFile, job); lastSaved = Date.now(); }
+      catch (error) { console.warn('Could not save the download queue:', error.message); }
+    }
     if (!window.isDestroyed()) window.webContents.send('download-progress',job);
   });
   handle('status', () => status());
   handle('load-repo', async link => {
     if (engine.busy) throw new Error('Pause the current download before loading another repository.');
     currentCatalog = null;
-    if (testing) { const info = core.parseLink(link); const files = readJSON(path.join(root,'tests','repository-fixture.json'),[]).filter(f => f.type === 'file'); currentCatalog = { ...core.catalog(info,files), allFiles:files }; }
+    // Two fixtures, chosen by the name pasted in: a GGUF repository and a repository
+    // published as safetensors only. The second one exercises the path where there is
+    // nothing to quantize, which is what a real model repository without GGUF builds
+    // looks like and where the interface used to go quiet.
+    if (testing) { const info = core.parseLink(link); const fixture = /-GGUF$/i.test(info.repo) ? 'repository-fixture.json' : 'repository-fixture-safetensors.json'; const files = readJSON(path.join(root,'tests',fixture),[]).filter(f => f.type === 'file'); currentCatalog = { ...core.catalog(info,files), allFiles:files }; }
     else currentCatalog = await core.listRepo(link, availableToken());
     const { allFiles, ...visible } = currentCatalog; return visible;
   });
@@ -127,7 +138,7 @@ if (primaryInstance) app.whenReady().then(() => {
   handle('save-settings', value => {
     if (engine.busy) throw new Error('Pause the download before changing settings.');
     const next = { outputDir:String(value.outputDir || settings.outputDir), quant:String(value.quant ?? settings.quant).slice(0,128), connections:Number(value.connections ?? settings.connections), disableIPv6:true, aria2Path:String(value.aria2Path ?? settings.aria2Path) };
-    if (!localDirectory(next.outputDir)) throw new Error('Choose a download folder on a local drive, starting with a drive letter such as C:\\.');
+    if (!destinationDirectory(next.outputDir)) throw new Error('Choose a folder on a local drive or a network share such as \\\\server\\share.');
     if (!Number.isInteger(next.connections) || next.connections < 1 || next.connections > 16) throw new Error('Connections must be between 1 and 16.');
     if (next.aria2Path) core.findAria(next.aria2Path,root);
     if (typeof value.token === 'string') sessionToken = core.validToken(value.token);

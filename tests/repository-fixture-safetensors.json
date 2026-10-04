@@ -1,0 +1,11 @@
+[
+  { "type": "file", "path": ".gitattributes", "size": 1519 },
+  { "type": "file", "path": "README.md", "size": 29742 },
+  { "type": "file", "path": "chat_template.jinja", "size": 18104 },
+  { "type": "file", "path": "config.json", "size": 4233 },
+  { "type": "file", "path": "generation_config.json", "size": 260 },
+  { "type": "file", "path": "model.safetensors", "size": 23924668416 },
+  { "type": "file", "path": "processor_config.json", "size": 1094 },
+  { "type": "file", "path": "tokenizer.json", "size": 32172089 },
+  { "type": "file", "path": "tokenizer_config.json", "size": 22458 }
+]

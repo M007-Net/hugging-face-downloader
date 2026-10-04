@@ -17,14 +17,14 @@ than linked into anything here.
 
 | Component | Version | License and source |
 | --- | --- | --- |
-| Electron | 44.3.0 | MIT for Electron itself; bundles Chromium (BSD-3-Clause and others) and Node.js (MIT). Upstream license notices are included in the packaged application. https://github.com/electron/electron |
+| Electron | 44.4.1 | MIT for Electron itself; bundles Chromium (BSD-3-Clause and others) and Node.js (MIT). Upstream license notices are included in the packaged application. https://github.com/electron/electron |
 
 The desktop application has **no runtime npm dependencies**. `package.json`
 lists only development dependencies:
 
 | Package | Version | Used for | License |
 | --- | --- | --- | --- |
-| electron | 44.3.0 | Running and packaging the desktop app | MIT |
+| electron | 44.4.1 | Running and packaging the desktop app | MIT |
 | electron-builder | 26.15.3 | Building the Windows installer | MIT |
 | playwright | ^1.55.0 | The optional `qa:electron` window smoke test | Apache-2.0 |
 

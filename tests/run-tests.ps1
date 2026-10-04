@@ -85,21 +85,27 @@ Assert ($transferArgs[1] -eq '4' -and $transferArgs[3] -eq '4') 'Configurable co
 Assert ('--disable-ipv6=true' -in $transferArgs) 'IPv4-only transfer mode'
 $script:TransferDisableIPv6 = $false
 Assert ('--disable-ipv6=true' -in @(Get-Aria2Args)) 'IPv4-only mode cannot be disabled'
-# The bearer token must never reach the command line, where every other process
-# on the machine can read it, and never a file on disk, where a killed run would
-# leave it behind. It goes to aria2 on stdin and nowhere else.
+# The bearer token must never reach aria2: aria2 has no redirect cap and repeats
+# custom headers at redirect targets. Authenticated downloads either resolve to a
+# public URL or fail closed before any transfer begins.
 Assert (-not (@(Get-Aria2Args) -match 'Authorization')) 'Token is not passed as an argument'
 $digest = 'ab' * 32
-# Served directly by huggingface.co: the header may go, but only because redirects are
-# switched off for that item, so aria2 cannot forward it anywhere.
+# A direct Hugging Face URL is safe for aria2 only when no bearer header is needed.
 $manifest = New-Aria2Manifest -Items @([pscustomobject]@{
     Url = 'https://huggingface.co/a/b/resolve/main/m.gguf'; Out = 'm.gguf'; Sha256 = $digest
-    Resolved = [pscustomobject]@{ Url = 'https://huggingface.co/a/b/resolve/main/m.gguf'; SendToken = $true; MaxRedirect = 0 } }) -Token 'secret-token'
+    Resolved = [pscustomobject]@{ Url = 'https://huggingface.co/a/b/resolve/main/m.gguf'; SendToken = $false } }) -Token 'secret-token'
 Assert ($manifest -match "`n") 'The manifest is content, not the path of a file on disk'
-Assert ($manifest -match 'header=Authorization: Bearer secret-token') 'Token travels in the manifest'
-Assert ($manifest -match '(?m)^\s+max-redirect=0\s*$') 'A manifest carrying the token forbids redirects'
+Assert ($manifest -notmatch 'Authorization|secret-token') 'No bearer token is present in the aria2 manifest'
+Assert ($manifest -notmatch 'max-redirect') 'No unsupported redirect option is emitted'
 Assert ($manifest -match '(?m)^\s+out=m\.gguf\.part\s*$') 'Manifest downloads to a .part file'
 Assert ($manifest -match ('(?m)^\s+checksum=sha-256=' + $digest + '\s*$')) 'Manifest carries the LFS digest'
+$tokenManifestRejected = $false
+try {
+    New-Aria2Manifest -Items @([pscustomobject]@{
+        Url = 'https://huggingface.co/a/b/resolve/main/private.gguf'; Out = 'private.gguf'; Sha256 = ''
+        Resolved = [pscustomobject]@{ Url = 'https://huggingface.co/a/b/resolve/main/private.gguf'; SendToken = $true } }) -Token 'secret-token'
+} catch { $tokenManifestRejected = $true }
+Assert $tokenManifestRejected 'An authenticated direct response cannot be queued to aria2'
 $anonManifest = New-Aria2Manifest -Items @([pscustomobject]@{ Url = 'https://x/y'; Out = 'y'; Sha256 = '' }) -Token ''
 Assert ($anonManifest -notmatch 'Authorization') 'No auth header without a token'
 
@@ -108,14 +114,10 @@ Assert ($anonManifest -notmatch 'Authorization') 'No auth header without a token
 # token reaches that third party. Those CDN URLs are pre-signed and need no credential.
 $cdnManifest = New-Aria2Manifest -Items @([pscustomobject]@{
     Url = 'https://huggingface.co/a/b/resolve/main/m.gguf'; Out = 'm.gguf'; Sha256 = $digest
-    Resolved = [pscustomobject]@{ Url = 'https://cas-bridge.xethub.hf.co/signed/abc'; SendToken = $false; MaxRedirect = 10 } }) -Token 'secret-token'
+    Resolved = [pscustomobject]@{ Url = 'https://cas-bridge.xethub.hf.co/signed/abc'; SendToken = $false } }) -Token 'secret-token'
 Assert ($cdnManifest -notmatch 'Authorization') 'The token never reaches a host other than huggingface.co'
 Assert ($cdnManifest -notmatch 'secret-token') 'The token appears nowhere in a CDN manifest'
 Assert ($cdnManifest -match 'cas-bridge\.xethub\.hf\.co') 'The resolved signed URL is what aria2 fetches'
-# Any manifest line carrying the credential must sit beside max-redirect=0.
-foreach ($line in ($manifest -split "`n")) {
-    if ($line -match 'Authorization') { Assert ($manifest -match '(?m)^\s+max-redirect=0\s*$') 'A credential is only ever emitted with redirects disabled' }
-}
 Assert (@(Get-Aria2Args) -contains '--no-conf=true') 'A user aria2.conf cannot silently change TLS checking, the output folder, or run a program'
 
 # Neither a size nor a digest means nothing distinguishes a complete file from one
@@ -291,7 +293,7 @@ $tempModel = $script:AppSettingsPath + '.gguf'
 try {
     [IO.File]::WriteAllBytes($tempModel, [byte[]]@(1,2,3))
     # SHA-256 of the bytes 01 02 03.
-    $knownHash = (Get-FileHash -LiteralPath $tempModel -Algorithm SHA256).Hash.ToLowerInvariant()
+    $knownHash = '039058c6f2c0cb492c533b0a4d14ef77cc0f78abccced5287d84a1a2011cfb81'
     Assert (Test-CompleteFile $tempModel 3) 'Complete file'
     Assert (Test-CompleteFile -Path $tempModel -Size 3 -Sha256 $knownHash) 'Existing file matching its digest is reused'
     # Same size, different bytes: the reason a digest is worth checking at all.
@@ -356,12 +358,55 @@ function Remove-StubState {
     if ($script:stubRoot) { Remove-Item -Recurse -Force $script:stubRoot -ErrorAction SilentlyContinue }
     Remove-Item Env:HFD_STUB_CODE, Env:HFD_STUB_PARTIAL, Env:HFD_STUB_LOG -ErrorAction SilentlyContinue
 }
-trap { Remove-StubState; break }
-# Stand in for the redirect walk so the transfer tests stay offline. The resolver's own
-# behaviour is covered by the manifest assertions above.
+trap {
+    if ($script:stubRoot -and (Test-Path -LiteralPath $script:stubRoot)) { Remove-Item -LiteralPath $script:stubRoot -Recurse -Force -ErrorAction SilentlyContinue }
+    throw $_
+}
+# Exercise the terminal redirect walk against a deterministic HTTP response seam.
+# This covers the PS 5.1 case where Invoke-WebRequest can throw without exposing its
+# 302 response, and verifies the credential is only sent on Hugging Face hops.
+foreach ($statement in $ast.EndBlock.Statements) {
+    if ($statement -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $statement.Name -in @('Resolve-HFDownload','Invoke-HFHeadRequest')) { . ([scriptblock]::Create($statement.Extent.Text)) }
+}
+$script:hfHeadCalls = @()
+$script:hfHeadResponses = New-Object 'System.Collections.Generic.Queue[object]'
+function Mock-HFHeadResponse([int]$Status, [string]$Location) {
+    $headers = New-Object Net.WebHeaderCollection
+    if ($Location) { $headers['Location'] = $Location }
+    return [pscustomobject]@{ StatusCode = $Status; Headers = $headers }
+}
+function Invoke-HFHeadRequest {
+    param([string]$Url, [hashtable]$Headers, [int]$TimeoutSec = 30)
+    $script:hfHeadCalls += [pscustomobject]@{ Url = $Url; Headers = $Headers }
+    return $script:hfHeadResponses.Dequeue()
+}
+$script:hfHeadResponses.Enqueue((Mock-HFHeadResponse 302 '/owner/model/resolve/main/model.gguf'))
+$script:hfHeadResponses.Enqueue((Mock-HFHeadResponse 302 'https://cdn-lfs.huggingface.co/signed/model'))
+$resolvedHF = Resolve-HFDownload -Url 'https://huggingface.co/owner/model/resolve/main/model.gguf' -Token 'secret-token'
+Assert ($resolvedHF.Url -eq 'https://cdn-lfs.huggingface.co/signed/model' -and -not $resolvedHF.SendToken) 'A two-hop HF redirect resolves to a credential-free CDN URL'
+Assert ($script:hfHeadCalls.Count -eq 2) 'Both Hugging Face redirects are checked before transfer'
+Assert ($script:hfHeadCalls[0].Headers.Authorization -eq 'Bearer secret-token' -and $script:hfHeadCalls[1].Headers.Authorization -eq 'Bearer secret-token') 'Token is retained only while redirect stays on huggingface.co'
+$script:hfHeadCalls = @()
+$script:hfHeadResponses.Enqueue((Mock-HFHeadResponse 302 'https://cdn-lfs.huggingface.co/signed/model'))
+$resolvedCDN = Resolve-HFDownload -Url 'https://huggingface.co/owner/model/resolve/main/model.gguf' -Token 'secret-token'
+Assert ($script:hfHeadCalls.Count -eq 1 -and -not $resolvedCDN.SendToken) 'CDN follow-through is delegated only after leaving the credentialed origin'
+$script:hfHeadCalls = @()
+$script:hfHeadResponses.Enqueue((Mock-HFHeadResponse 200 ''))
+$script:hfHeadResponses.Enqueue((Mock-HFHeadResponse 200 ''))
+$directPublic = Resolve-HFDownload -Url 'https://huggingface.co/owner/model/resolve/main/config.json' -Token 'secret-token'
+Assert (-not $directPublic.SendToken) 'A public direct response is rechecked without a token before aria2 is allowed'
+Assert ($script:hfHeadCalls.Count -eq 2 -and -not $script:hfHeadCalls[1].Headers.ContainsKey('Authorization')) 'The public direct-response check omits Authorization'
+$script:hfHeadCalls = @()
+$script:hfHeadResponses.Enqueue((Mock-HFHeadResponse 200 ''))
+$script:hfHeadResponses.Enqueue((Mock-HFHeadResponse 401 ''))
+$privateDirectRejected = $false
+try { Resolve-HFDownload -Url 'https://huggingface.co/owner/model/resolve/main/private.json' -Token 'secret-token' } catch { $privateDirectRejected = $_.Exception.Message -match 'cannot be downloaded safely by aria2' }
+Assert $privateDirectRejected 'A private direct response fails closed before an unsafe aria2 transfer'
+
+# Stand in for redirect resolution during the transfer-engine tests.
 function Resolve-HFDownload {
     param([string]$Url, [string]$Token)
-    return [pscustomobject]@{ Url = $Url; SendToken = [bool]$Token; MaxRedirect = 0 }
+    return [pscustomobject]@{ Url = $Url; SendToken = $false }
 }
 $smallItems = @(
     [pscustomobject]@{ Url = 'https://huggingface.co/a/b/resolve/main/one.json'; Out = 'one.json'; Size = 4096 },
@@ -393,7 +438,7 @@ $stubCall = Get-Content -LiteralPath $env:HFD_STUB_LOG -Raw
 $stubArgs = ($stubCall -split '--- manifest ---')[0]
 Assert ($stubArgs -notmatch 'secret-token') 'The token never appears on the aria2 command line'
 Assert ($stubArgs -match '--input-file=-') 'The manifest is read from stdin'
-Assert (($stubCall -split '--- manifest ---')[1] -match 'Bearer secret-token') 'The token reaches aria2 through the manifest'
+Assert (($stubCall -split '--- manifest ---')[1] -notmatch 'Bearer secret-token|Authorization') 'The token never reaches aria2 through the manifest'
 Assert (@(Get-ChildItem -LiteralPath ([IO.Path]::GetTempPath()) -Filter 'hf-aria2-*.txt' -ErrorAction SilentlyContinue).Count -eq 0) 'No manifest is written to the temp folder'
 Remove-Item Env:HFD_STUB_LOG -ErrorAction SilentlyContinue
 
@@ -428,6 +473,21 @@ $noRoom = $false
 try { Assert-FreeSpace -DestDir $stubRoot -Needed ([int64]900PB) } catch { $noRoom = $true }
 Assert $noRoom 'A download larger than the volume is refused before it starts'
 Assert-FreeSpace -DestDir $stubRoot -Needed 1024
+# DriveInfo rejects UNC roots. The Windows disk-space API path must still be
+# selected for a share path, while a missing/offline share remains unknown.
+$uncFree = Get-AvailableFreeSpace -Path '\\server\share\folder with spaces'
+Assert ($null -eq $uncFree) 'An unreachable UNC share reports unknown capacity without throwing'
+$freeSpaceDefinition = ([System.Management.Automation.Language.Parser]::ParseFile((Join-Path (Split-Path $PSScriptRoot -Parent) 'hf-download.ps1'), [ref]$tokens, [ref]$errors)).EndBlock.Statements |
+    Where-Object { $_ -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $_.Name -eq 'Get-AvailableFreeSpace' } |
+    Select-Object -First 1
+. ([scriptblock]::Create($freeSpaceDefinition.Extent.Text))
+$script:seenFreePath = $null
+function Get-AvailableFreeSpace { param([string]$Path); $script:seenFreePath = $Path; return [uint64]1024 }
+$uncShortfall = $false
+try { Assert-FreeSpace -DestDir '\\server\share\models' -Needed 2000 } catch { $uncShortfall = $true }
+Assert $uncShortfall 'Known UNC free-space shortfall is rejected'
+Assert ($script:seenFreePath -eq '\\server\share\models') 'UNC destination is queried directly for available space'
+. ([scriptblock]::Create($freeSpaceDefinition.Extent.Text))
 $script:checks++
 $env:HFD_STUB_CODE = '3'; $env:HFD_STUB_PARTIAL = '0'
 $mixed = @([pscustomobject]@{ Url = 'https://huggingface.co/a/b/resolve/main/big.gguf'; Out = 'big.gguf'; Size = 200MB }) + $smallItems

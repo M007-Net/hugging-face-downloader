@@ -40,7 +40,18 @@ assert.ok(/not verified/i.test(renderer), 'Companion badge must disclaim verific
 // An unknown size is shown as unknown rather than as zero bytes.
 assert.ok(/Unknown/.test(renderer), 'Unknown file sizes must be labelled');
 for (const required of ['help-column', 'grid-template-columns:minmax(0,1fr) 235px', '@media(max-width:1150px)', '.review', '.companion']) assert.ok(css.includes(required), `Missing UI styling: ${required}`);
-assert.ok(/data-help="repo"/.test(renderer) && /data-help="quant"/.test(renderer) && /data-help="companions"/.test(renderer) && /data-help="destination"/.test(renderer));
+// The guidance panel is keyed by section. One of those keys is now chosen while
+// rendering - a repository with no GGUF builds needs different advice from one full
+// of quantizations - so a literal data-help="quant" no longer appears anywhere. The
+// invariant worth holding is that every key has copy behind it and every section
+// claims one, which is what actually breaks the panel when it goes wrong.
+for (const key of ['repo', 'quant', 'files', 'companions', 'destination', 'downloads', 'settings']) {
+  assert.ok(renderer.includes(key + ":['"), `The guidance panel has no copy for: ${key}`);
+}
+for (const key of ['repo', 'companions', 'destination', 'settings']) {
+  assert.ok(renderer.includes(`data-help="${key}"`), `No section asks for the ${key} guidance`);
+}
+assert.ok(renderer.includes(`data-help="\${hasQuant(c)?'quant':'files'}"`), 'The download section must switch guidance when there is nothing to quantize');
 assert.ok(/onProgress\(job=>/.test(renderer));
 assert.ok(/Content-Security-Policy/.test(html));
 assert.ok(/--disable-ipv6=true/.test(terminal), 'Terminal must enforce IPv4-only transfers');

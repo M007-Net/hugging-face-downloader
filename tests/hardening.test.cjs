@@ -21,24 +21,29 @@ test('a filename cannot use text-direction characters to disguise its extension'
   }
 });
 
-// path.isAbsolute() says yes to a UNC share, and both mkdir and aria2's --dir would then
-// reach out to it. Windows attempts NTLM against a remote share without asking, leaking
-// the account name and a challenge response to whoever runs that host.
-test('a download folder must be a local drive, not a UNC share', () => {
+// Network locations are supported only when selected as the destination. Keep device
+// namespaces and path traversal rejected while allowing UNC shares and mapped drives.
+test('a download folder accepts local, mapped, and UNC paths but rejects unsafe roots', () => {
   const src = fs.readFileSync(path.join(__dirname, '..', 'desktop', 'main.cjs'), 'utf8');
-  const body = src.slice(src.indexOf('function localDirectory'), src.indexOf('function cleanSettings'));
-  assert.ok(body, 'localDirectory must exist');
-  const localDirectory = eval('(' + body.replace(/^function localDirectory/, 'function') + ')');
+  const body = src.slice(src.indexOf('function destinationDirectory'), src.indexOf('function cleanSettings'));
+  assert.ok(body, 'destinationDirectory must exist');
+  const destinationDirectory = eval('(' + body.replace(/^function destinationDirectory/, 'function') + ')');
 
-  assert.equal(localDirectory(`C:${B}Users${B}John Smith${B}Downloads`), true, 'a normal path with a space is fine');
-  assert.equal(localDirectory('D:/Models'), true, 'forward slashes are fine');
-  assert.equal(localDirectory(`${B}${B}attacker.example${B}share`), false, 'a UNC share is refused');
-  assert.equal(localDirectory(`relative${B}path`), false, 'a relative path is refused');
-  assert.equal(localDirectory(`C:${B}ok\u0001bad`), false, 'control characters are refused');
-  assert.equal(localDirectory(''), false);
-  assert.equal(localDirectory('C:'), false, 'a drive with no separator is not a folder');
+  assert.equal(destinationDirectory(`C:${B}Users${B}John Smith${B}Downloads`), true, 'a normal path with a space is fine');
+  assert.equal(destinationDirectory('D:/Models'), true, 'forward slashes are fine');
+  assert.equal(destinationDirectory(`${B}${B}fileserver${B}models`), true, 'a UNC share root is accepted');
+  assert.equal(destinationDirectory('//fileserver/models/HuggingFace'), true, 'slash-form UNC paths are accepted');
+  assert.equal(destinationDirectory(`${B}${B}fileserver${B}models${B}nested`), true, 'a folder below a share is accepted');
+  assert.equal(destinationDirectory(`${B}${B}?${B}C:${B}models`), false, 'extended device paths are refused');
+  assert.equal(destinationDirectory(`${B}${B}.${B}PhysicalDrive0`), false, 'device namespace paths are refused');
+  assert.equal(destinationDirectory(`${B}${B}fileserver${B}models${B}..${B}other`), false, 'UNC traversal is refused');
+  assert.equal(destinationDirectory(`${B}${B}fileserver`), false, 'a server without a share is refused');
+  assert.equal(destinationDirectory(`relative${B}path`), false, 'a relative path is refused');
+  assert.equal(destinationDirectory(`C:${B}ok\u0001bad`), false, 'control characters are refused');
+  assert.equal(destinationDirectory(''), false);
+  assert.equal(destinationDirectory('C:'), false, 'a drive with no separator is not a folder');
 
-  assert.ok(src.includes('localDirectory(next.outputDir)'), 'save-settings uses the same check');
+  assert.ok(src.includes('destinationDirectory(next.outputDir)'), 'save-settings uses the same check');
 });
 
 // A listener writing last-download.json on every tick can fail for reasons unrelated to
@@ -47,7 +52,7 @@ test('a download folder must be a local drive, not a UNC share', () => {
 test('a failing progress listener cannot fail the download or orphan aria2', () => {
   const src = fs.readFileSync(path.join(__dirname, '..', 'desktop', 'transfer.cjs'), 'utf8');
   assert.match(src, /publish\(\)\s*\{\s*try\s*\{\s*this\.emit\('update'/, 'publish swallows listener errors');
-  const perFile = src.slice(src.indexOf('} catch (error) {', src.indexOf('file.status = \'verifying\'')));
+  const perFile = src.slice(src.indexOf('} catch (error) {', src.indexOf('const prepared = await')));
   assert.ok(perFile.includes('this.child.kill()'), 'the per-file catch kills the child before moving on');
 });
 
@@ -106,4 +111,37 @@ test('every test file is actually listed in the npm test script', () => {
   assert.deepEqual(gone, [], `npm test names files that no longer exist: ${gone.join(', ')}`);
 
   assert.ok(!script.includes('*'), 'no glob: it does not expand on the oldest supported Node');
+});
+
+// Electron 44 dropped its own postinstall script, so `npm install` stopped fetching
+// the runtime: the package unpacked, `node_modules/electron/dist` stayed empty, and
+// every launcher here reported missing dependencies on a tree that had just installed
+// cleanly. A project-level postinstall asks for the binary instead. Nothing in the
+// suite can prove the download works - CI deliberately skips it - but the wiring that
+// makes it happen at all is checkable, and it is exactly what silently went missing.
+test('installing the project also fetches the Electron runtime', () => {
+  const root = path.join(__dirname, '..');
+  const scripts = require(path.join(root, 'package.json')).scripts;
+
+  assert.ok(scripts.postinstall, 'package.json must run something after install');
+  const target = 'scripts/install-electron.cjs';
+  assert.ok(scripts.postinstall.includes(target), `postinstall must run ${target}`);
+  assert.ok(fs.existsSync(path.join(root, target)), `${target} is named by postinstall but missing`);
+});
+
+// CI runs the suites that never open a window, and sets ELECTRON_SKIP_BINARY_DOWNLOAD
+// so `npm ci` stays off a quarter-gigabyte download. Electron's own install.js does not
+// read that variable - the wrapper is what honours it, and a wrapper that ignored it
+// would add minutes to every job without anyone noticing why.
+test('the runtime fetch can be skipped, as CI does', () => {
+  const { spawnSync } = require('node:child_process');
+  const root = path.join(__dirname, '..');
+
+  const run = spawnSync(process.execPath, [path.join(root, 'scripts', 'install-electron.cjs')], {
+    env: { ...process.env, ELECTRON_SKIP_BINARY_DOWNLOAD: '1' },
+    encoding: 'utf8'
+  });
+
+  assert.equal(run.status, 0, 'skipping must succeed, not fail the install');
+  assert.match(run.stdout, /ELECTRON_SKIP_BINARY_DOWNLOAD/, 'it should say why it did nothing');
 });

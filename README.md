@@ -411,18 +411,27 @@ Models are saved as `download-root\owner\repository\path`. Datasets and Spaces
 go under `datasets\` and `spaces\`. No destination depends on the author's
 username or on which applications you have installed.
 
+The download root can be a local folder, a mapped drive, or a Windows network
+share such as `\\server\models`. In the desktop app, enter the share in
+**Settings → Default folder** or choose it with **Browse folders**. For the
+terminal version, pass `-OutputDir '\\server\models'` or set
+`HF_DOWNLOADER_OUTPUT` to that path. The Windows account running the downloader
+needs write access to the share. Choose a share you trust: connecting to a
+Windows network share may send Windows authentication data to its server.
+
 ---
 
 ## How downloads are verified
 
-- Every file downloads to a `.part` file and is renamed to its real name only
-  after the size matches and, where Hugging Face publishes a SHA-256, the hash
-  matches too.
-- A `.part` file that fails verification is **kept**, so you can inspect it and
-  so a later run resumes rather than restarting.
-- A file already on disk is reused only if it hashes to the expected digest.
-  Where Hugging Face publishes no digest — typically small non-LFS files — a
-  size match is accepted.
+- The app downloads the selected files to `.part` files first. It then shows
+  **Checking downloaded files** and checks each file once before renaming it
+  to its real name. Where Hugging Face publishes a SHA-256, the hash must match.
+- Interrupted `.part` files are kept so a later run can resume. In the desktop
+  app, files that fail verification are kept with a `.failed-` suffix; retry
+  downloads a fresh copy instead of repeatedly checking the same bad bytes.
+- A file already on disk is checked in the final checking phase. Where Hugging
+  Face publishes no digest — typically small non-LFS files — a size match is
+  accepted.
 - Each listing is pinned to the commit it came from, so a branch that moves
   between listing and download cannot quietly swap the bytes.
 - Repository paths are checked against Windows naming rules, including reserved
@@ -437,9 +446,10 @@ username or on which applications you have installed.
   download is refused rather than finished on trust.
 - A folder being written to is locked, so two copies of the app cannot fight
   over the same files.
-- The download engine and the destination folder must both be on a local drive.
-  A network location is refused, so neither can pull a program from, or write to,
-  another machine.
+- The aria2 executable must be local. The destination may be a network share
+  selected by the user; transfer verification and `.part` staging also happen
+  there. Available-space checks use the destination volume when Windows reports
+  its capacity.
 
 ### Where your token goes
 
@@ -449,13 +459,16 @@ Every large file on Hugging Face is stored with Git LFS, and a `/resolve/` URL f
 one answers with a redirect to a content delivery network on a different domain
 (`cas-bridge.xethub.hf.co` and similar). Those CDN addresses are already signed and
 need no credential. Both engines therefore walk the redirect themselves and hand
-aria2 the final signed address with **no** `Authorization` header. When Hugging Face
-serves a file directly instead, aria2 does get the header — and that download is
-given `max-redirect=0`, so it cannot forward it anywhere.
+aria2 the final signed address with **no** `Authorization` header. If Hugging Face
+serves a file directly, the downloader checks that it is publicly accessible
+without a token before giving its URL to aria2. Private files served directly
+without a signed URL are refused, because aria2 can forward custom headers on
+redirects.
 
 The token is never put on a command line (where any other account on the machine
-could read it), never written to the settings file, and never printed. It reaches
-aria2 only through the manifest on its standard input.
+could read it), never written to the settings file or aria2 input, and never
+printed. Only the downloader's own Hugging Face metadata and redirect requests
+use it.
 
 [SECURITY.md](SECURITY.md) covers what is and is not checked, and how to report
 a vulnerability.
@@ -515,22 +528,25 @@ npm ci                  # the exact locked dependency set, the same one CI insta
 npm test                # Node unit tests: selection, paths, transfers, updater
 npm run qa              # Static UI, launcher, and security-wiring checks
 npm run test:terminal   # the PowerShell engine's offline suite
+npm run test:aria2      # Optional real-engine pause/resume check; requires aria2
 npm run package         # Build the Windows installer into release\
 ```
 
 `npm ci` installs from the committed `package-lock.json` and reproduces the versions
 listed in [THIRD_PARTY.md](THIRD_PARTY.md); `npm install` may resolve newer ones.
 
-As of 0.3.0 that is **33 Node tests**, **146 PowerShell checks**, and the static
+The current suites cover **52 Node tests**, **156 PowerShell checks**, and the static
 UI pass. Tests import function definitions without starting the downloader, mock
 user input and transfers, and use a checked-in listing fixture. **No test
-downloads a model, and no test reaches the network.**
+downloads a model.** The standard suites use no network requests. The optional
+`test:aria2` check serves a small fixture on loopback, pauses twice, restores the
+saved queue, and verifies byte-range resume and the final SHA-256.
 
 `npm run qa:electron` runs an interactive Playwright pass on machines with a
 working Electron inspector.
 
 GitHub Actions runs the terminal tests under both Windows PowerShell 5.1 and
-PowerShell 7, the desktop suites under Node 20, and CodeQL weekly.
+PowerShell 7, the desktop suites under Node 20 and 22, and CodeQL weekly.
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) before opening a pull request, and
 [THIRD_PARTY.md](THIRD_PARTY.md) for what this project depends on.

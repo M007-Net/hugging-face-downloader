@@ -11,16 +11,18 @@
   "repository": { "type": "git", "url": "https://github.com/M007-Net/hugging-face-downloader" },
   "main": "desktop/main.cjs",
   "scripts": {
+    "postinstall": "node scripts/install-electron.cjs",
     "start": "electron .",
     "test": "node --test tests/core.test.cjs tests/transfer.test.cjs tests/updater.test.cjs tests/hardening.test.cjs",
     "test:terminal": "powershell -NoProfile -ExecutionPolicy Bypass -File tests/run-tests.ps1",
+    "test:aria2": "node --test tests/aria2-integration.cjs",
     "icon": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/icon.ps1",
     "qa": "node tests/ui-static.cjs",
     "qa:electron": "node tests/ui-qa.cjs",
     "package": "electron-builder --win nsis --x64"
   },
   "devDependencies": {
-    "electron": "44.3.0",
+    "electron": "44.4.1",
     "electron-builder": "26.15.3",
     "playwright": "^1.55.0"
   },
